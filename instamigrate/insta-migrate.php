@@ -3,7 +3,7 @@
  * Plugin Name: InstaMigrate
  * Plugin URI: https://wordpress.org/plugins/instamigrate/
  * Description: Migration helper for WordPress site transfers. Provides secure REST API endpoints for database import, file transfer, and search-replace. REMOVE THIS PLUGIN AFTER MIGRATION.
- * Version: 1.8.9
+ * Version: 1.9.0
  * Author: InstaWP
  * Author URI: https://instawp.com/
  * License: MIT
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('INSTA_MIGRATE_VERSION', '1.8.9');
+define('INSTA_MIGRATE_VERSION', '1.9.0');
 define('INSTA_MIGRATE_OPTION_KEY', 'insta_migrate_api_key');
 define('INSTA_MIGRATE_TEMP_DIR', wp_upload_dir()['basedir'] . '/instamigrate');
 
@@ -131,6 +131,9 @@ class InstaMigrate {
 
     public function __construct() {
         add_action('rest_api_init', [$this, 'register_routes']);
+        // Lets a request that carries this plugin's own credential past other plugins'
+        // "REST API for logged-in users only" blocks, on this plugin's routes only.
+        add_filter('rest_authentication_errors', [$this, 'rest_authentication_bypass'], 999);
         // Admin menu: network admin when network-activated on multisite, otherwise regular admin
         if ($this->is_network_active()) {
             add_action('network_admin_menu', [$this, 'add_admin_page']);
@@ -894,14 +897,11 @@ class InstaMigrate {
         @set_time_limit(300);
         @ini_set('memory_limit', '512M');
 
-        $body   = $request->get_json_params() ?: [];
-        $secret = (isset($body['secret']) ? $body['secret'] : $request->get_header('x-bridge-secret'));
-
         $cfg = $this->bridge_load_config();
         if (!$cfg || empty($cfg['active'])) {
             return new WP_Error('bridge_inactive', 'Bridge is not active.', ['status' => 409]);
         }
-        if (!$secret || !hash_equals((string) $cfg['secret'], (string) $secret)) {
+        if (!$this->bridge_secret_matches($request, $cfg)) {
             return new WP_Error('unauthorized', 'Invalid bridge secret.', ['status' => 401]);
         }
 
@@ -917,6 +917,23 @@ class InstaMigrate {
             $this->bridge_self_trigger();
         }
         exit;
+    }
+
+    /**
+     * Whether the request carries the active bridge's secret, in the JSON body or the
+     * X-Bridge-Secret header. Shared by route_bridge_tick() and the REST authentication gate.
+     *
+     * @param WP_REST_Request $request
+     * @param array           $cfg     Bridge config from bridge_load_config().
+     * @return bool
+     */
+    private function bridge_secret_matches(WP_REST_Request $request, $cfg) {
+        $body   = $request->get_json_params() ?: [];
+        $secret = (isset($body['secret']) ? $body['secret'] : $request->get_header('x-bridge-secret'));
+        $stored = isset($cfg['secret']) ? $cfg['secret'] : '';
+
+        return is_string($secret) && $secret !== '' && is_string($stored) && $stored !== ''
+            && hash_equals($stored, $secret);
     }
 
     /**
@@ -1559,25 +1576,7 @@ class InstaMigrate {
      * Falls back to WP Application Password Basic Auth (requires manage_options).
      */
     public function check_auth(WP_REST_Request $request) {
-        // Method 1: X-Insta-Key header
-        $provided = $request->get_header('X-Insta-Key');
-
-        // Method 1b: Query parameter fallback (CDNs like Bunny strip custom headers)
-        if (!$provided && isset($_GET['api_key'])) {
-            $provided = sanitize_text_field(wp_unslash($_GET['api_key']));
-        }
-        if (!$provided) {
-            $provided = $request->get_param('api_key');
-        }
-
-        // Method 1c: Direct $_SERVER check (Apache may mangle header name)
-        if (!$provided && !empty($_SERVER['HTTP_X_INSTA_KEY'])) {
-            $provided = sanitize_text_field(wp_unslash($_SERVER['HTTP_X_INSTA_KEY']));
-        }
-
-        $stored = $this->get_api_key();
-
-        if ($provided && $stored && hash_equals($stored, $provided)) {
+        if ($this->request_has_valid_api_key($request)) {
             return true;
         }
 
@@ -1596,6 +1595,173 @@ class InstaMigrate {
             'Invalid or missing credentials. Send X-Insta-Key header or use WordPress Application Password.',
             ['status' => 401]
         );
+    }
+
+    /**
+     * Whether the request carries this site's API key. The key half of check_auth(), shared
+     * with the REST authentication gate so both accept exactly the same requests.
+     *
+     * @param WP_REST_Request $request
+     * @return bool
+     */
+    private function request_has_valid_api_key(WP_REST_Request $request) {
+        // Method 1: X-Insta-Key header
+        $provided = $request->get_header('X-Insta-Key');
+
+        // Method 1b: Query parameter fallback (CDNs like Bunny strip custom headers)
+        if (!$provided && isset($_GET['api_key'])) {
+            $provided = sanitize_text_field(wp_unslash($_GET['api_key']));
+        }
+        if (!$provided) {
+            $provided = $request->get_param('api_key');
+        }
+
+        // Method 1c: Direct $_SERVER check (Apache may mangle header name)
+        if (!$provided && !empty($_SERVER['HTTP_X_INSTA_KEY'])) {
+            $provided = sanitize_text_field(wp_unslash($_SERVER['HTTP_X_INSTA_KEY']));
+        }
+
+        $stored = $this->get_api_key();
+
+        // A non-string value (e.g. api_key[]=x) is not a key; hash_equals() would throw on it.
+        return is_string($provided) && $provided !== '' && is_string($stored) && $stored !== ''
+            && hash_equals($stored, $provided);
+    }
+
+    // ─── REST authentication gate ────────────────────────────────
+
+    /**
+     * Per-route results of rest_request_is_authenticated() for the current request.
+     *
+     * @var array<string, bool>
+     */
+    private $rest_auth_results = [];
+
+    /**
+     * `rest_authentication_errors` at priority 999.
+     *
+     * Plugins such as "Disable WP REST API" or "Force Login" reject every REST request from a
+     * visitor who is not logged in, before any route's permission_callback runs, so a valid
+     * X-Insta-Key never gets checked. This clears such a block ONLY when all of these hold:
+     *   - the route is in this plugin's namespace (anchored, case-insensitive, like core routing);
+     *   - the request presents no WordPress user credential: no login cookie and no
+     *     Authorization header. Such requests keep core's result, including its cookie nonce
+     *     check and its application-password errors;
+     *   - the request carries that route's own credential, checked by the same function the
+     *     route uses: the API key, or the bridge secret for /bridge/tick.
+     * Otherwise $access is returned untouched, so a wrong or missing credential still gets the
+     * blocking plugin's error. Only a request that already carries an authentication error is
+     * changed; note this clears ANY plugin's error on these routes (an IP allowlist built on this
+     * filter included) for a holder of the key, which already controls the site through them.
+     *
+     * @param WP_Error|null|true $access
+     * @return WP_Error|null|true
+     */
+    public function rest_authentication_bypass($access) {
+        if (!is_wp_error($access)) {
+            return $access;
+        }
+
+        $route = $this->current_rest_route();
+        if ($route === '' || !preg_match('@^/insta-migrate/@i', $route)) {
+            return $access;
+        }
+
+        return $this->rest_request_is_authenticated($route) ? true : $access;
+    }
+
+    /**
+     * The REST route being served, as core will route it.
+     *
+     * @return string
+     */
+    private function current_rest_route() {
+        if (!isset($GLOBALS['wp']) || !is_object($GLOBALS['wp']) || empty($GLOBALS['wp']->query_vars['rest_route'])) {
+            return '';
+        }
+        $route = $GLOBALS['wp']->query_vars['rest_route'];
+
+        return is_string($route) ? untrailingslashit($route) : '';
+    }
+
+    /**
+     * Whether the current request carries a valid credential for $route.
+     *
+     * @param string $route
+     * @return bool
+     */
+    private function rest_request_is_authenticated($route) {
+        // Before rest_api_init there is no REST server to read the request with.
+        if ($this->has_wp_user_credentials() || !did_action('rest_api_init')) {
+            return false;
+        }
+
+        $key = strtolower($route);
+        if (isset($this->rest_auth_results[$key])) {
+            return $this->rest_auth_results[$key];
+        }
+
+        // Anchored like core's route matching, whose `$` also matches before a trailing newline.
+        if (preg_match('@^/insta-migrate/v1/api-key$@i', $route)) {
+            // Application-password only; core has already authenticated such a request.
+            $result = false;
+        } elseif (preg_match('@^/insta-migrate/v1/bridge/tick$@i', $route)) {
+            $cfg    = $this->bridge_load_config();
+            $result = $cfg && !empty($cfg['active'])
+                && $this->bridge_secret_matches($this->rest_request_from_globals($route), $cfg);
+        } else {
+            $result = $this->request_has_valid_api_key($this->rest_request_from_globals($route));
+        }
+
+        return $this->rest_auth_results[$key] = $result;
+    }
+
+    /**
+     * Whether the request presents a WordPress user credential: a login cookie, or an
+     * Authorization header / Basic auth pair (what core reads for application passwords).
+     * The migration service authenticates with the API key alone, so such a request is never
+     * exempted and keeps core's authentication result.
+     *
+     * @return bool
+     */
+    private function has_wp_user_credentials() {
+        foreach (['AUTH_COOKIE', 'SECURE_AUTH_COOKIE', 'LOGGED_IN_COOKIE'] as $cookie) {
+            if (defined($cookie) && !empty($_COOKIE[constant($cookie)])) {
+                return true;
+            }
+        }
+        foreach (['PHP_AUTH_USER', 'HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION'] as $var) {
+            if (!empty($_SERVER[$var])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Build a WP_REST_Request from the current HTTP request the way WP_REST_Server::serve_request()
+     * does, because `rest_authentication_errors` runs before the server builds its own.
+     * The raw body is read only for a JSON request (the only kind get_param()/get_json_params()
+     * parse it for), so a large upload body is never copied.
+     *
+     * @param string $route
+     * @return WP_REST_Request
+     */
+    private function rest_request_from_globals($route) {
+        $method  = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string) $_SERVER['REQUEST_METHOD']) : 'GET';
+        $request = new WP_REST_Request($method, $route);
+        $request->set_headers(rest_get_server()->get_headers(wp_unslash($_SERVER)));
+        $request->set_query_params(wp_unslash($_GET));
+        $request->set_body_params(wp_unslash($_POST));
+        // is_json_content_type() is WP 5.6+; this plugin supports 5.0.
+        $ct      = $request->get_content_type();
+        $is_json = method_exists($request, 'is_json_content_type')
+            ? $request->is_json_content_type()
+            : ($ct && 'application/json' === $ct['value']);
+        if ($is_json) {
+            $request->set_body(WP_REST_Server::get_raw_data());
+        }
+        return $request;
     }
 
     /**

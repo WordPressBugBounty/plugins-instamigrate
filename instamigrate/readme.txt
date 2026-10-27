@@ -4,7 +4,7 @@ Tags: migration, transfer, backup, clone, database
 Requires at least: 5.0
 Tested up to: 7.0
 Requires PHP: 5.6
-Stable tag: 1.8.9
+Stable tag: 1.9.0
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -53,6 +53,11 @@ Yes. The search-replace engine correctly unserializes PHP data, performs replace
 Two methods: (1) `X-Insta-Key` header with the plugin API key, or (2) WordPress Application Passwords via HTTP Basic Auth (requires admin privileges).
 
 == Changelog ==
+
+= 1.9.0 =
+* Fix: migrations now work on sites that use a plugin to restrict the REST API to logged-in users.
+* Improvement: bridge mode is more reliable on those sites.
+* Improvement: better handling of malformed requests.
 
 = 1.8.9 =
 * Compatibility: now runs on PHP 5.6 and newer (was 7.0). Sites still on PHP 5.6 — common on older shared hosting — could not run the plugin at all, so they could not be migrated. Newer-PHP syntax was rewritten to its PHP 5.6 equivalent with identical behaviour on every version; error handling also catches ordinary exceptions on PHP 5.6, where the newer catch-all does not exist. Tested end to end on PHP 5.6 with WordPress 6.2, on PHP 7.0 with WordPress 6.5, and through the full release checks on current PHP.
