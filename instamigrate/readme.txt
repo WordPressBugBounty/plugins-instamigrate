@@ -4,7 +4,7 @@ Tags: migration, transfer, backup, clone, database
 Requires at least: 5.0
 Tested up to: 7.0
 Requires PHP: 5.6
-Stable tag: 1.9.0
+Stable tag: 1.9.1
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -53,6 +53,15 @@ Yes. The search-replace engine correctly unserializes PHP data, performs replace
 Two methods: (1) `X-Insta-Key` header with the plugin API key, or (2) WordPress Application Passwords via HTTP Basic Auth (requires admin privileges).
 
 == Changelog ==
+
+= 1.9.1 =
+* Fix: extracting a .tar or .tar.gz no longer loses files whose path is longer than 100 characters. Archives written in the common PAX format (Python, bsdtar, macOS tar) used to drop those files silently, and a plugin missing one of its files could take the whole site down. Every tar archive is now checked before anything is written, extracted, and verified file by file.
+* Fix: an extraction that leaves any file missing now fails with the list of missing files instead of reporting success. This applies to zip archives too.
+* Fix: archives that contain paths outside the destination folder are refused before anything is written.
+* Improvement: archives created by the plugin now keep files with very long paths (over 255 characters) instead of leaving them out.
+* New: a safe-activate endpoint that switches on a plugin, theme, must-use plugin or drop-in, checks the site still loads, and switches it off again automatically if it does not.
+* Improvement: the status endpoint reports which archive formats the server supports.
+* Fix: on PHP 8 hosts that disable set_time_limit, ini_set or ignore_user_abort, database and file routes no longer fail with a server error.
 
 = 1.9.0 =
 * Fix: migrations now work on sites that use a plugin to restrict the REST API to logged-in users.

@@ -3,7 +3,7 @@
  * Plugin Name: InstaMigrate
  * Plugin URI: https://wordpress.org/plugins/instamigrate/
  * Description: Migration helper for WordPress site transfers. Provides secure REST API endpoints for database import, file transfer, and search-replace. REMOVE THIS PLUGIN AFTER MIGRATION.
- * Version: 1.9.0
+ * Version: 1.9.1
  * Author: InstaWP
  * Author URI: https://instawp.com/
  * License: MIT
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('INSTA_MIGRATE_VERSION', '1.9.0');
+define('INSTA_MIGRATE_VERSION', '1.9.1');
 define('INSTA_MIGRATE_OPTION_KEY', 'insta_migrate_api_key');
 define('INSTA_MIGRATE_TEMP_DIR', wp_upload_dir()['basedir'] . '/instamigrate');
 
@@ -129,11 +129,37 @@ class InstaMigrate {
         return self::$instance;
     }
 
+    // Many shared hosts list set_time_limit / ini_set / ignore_user_abort in disable_functions.
+    // On PHP 8+ calling a disabled function is a FATAL "Call to undefined function" that `@` does
+    // not suppress (PHP 5.6/7 only warned), so every route that raised its time or memory limit
+    // died with a 500 on those hosts. Always call them through these guards (1.9.1).
+    private static function set_time_limit_safe($seconds) {
+        if (function_exists('set_time_limit')) {
+            @set_time_limit($seconds);
+        }
+    }
+
+    private static function ini_set_safe($key, $value) {
+        return function_exists('ini_set') ? @ini_set($key, $value) : false;
+    }
+
+    private static function ignore_user_abort_safe() {
+        if (function_exists('ignore_user_abort')) {
+            @ignore_user_abort(true);
+        }
+    }
+
     public function __construct() {
         add_action('rest_api_init', [$this, 'register_routes']);
+        // Records the PHP fatal of a /safe-activate health-check request (token-gated; no-op otherwise).
+        $this->maybe_watch_health_request();
         // Lets a request that carries this plugin's own credential past other plugins'
         // "REST API for logged-in users only" blocks, on this plugin's routes only.
         add_filter('rest_authentication_errors', [$this, 'rest_authentication_bypass'], 999);
+        // Never let a page cache keep this plugin's answers: an origin microcache was seen serving an
+        // authenticated /status to a keyless request (QA, 2026-10-29), and /status can now carry fatal
+        // details. Applies to insta-migrate/v1 routes only.
+        add_filter('rest_post_dispatch', [$this, 'rest_no_store'], 10, 3);
         // Admin menu: network admin when network-activated on multisite, otherwise regular admin
         if ($this->is_network_active()) {
             add_action('network_admin_menu', [$this, 'add_admin_page']);
@@ -545,7 +571,7 @@ class InstaMigrate {
         }
         $ok = @file_put_contents(INSTA_MIGRATE_BRIDGE_CONFIG_FILE, wp_json_encode($cfg, JSON_PRETTY_PRINT));
         if ($ok !== false) {
-            @chmod(INSTA_MIGRATE_BRIDGE_CONFIG_FILE, 0600);
+            self::chmod_safe(INSTA_MIGRATE_BRIDGE_CONFIG_FILE, 0600);
         }
         return $ok !== false;
     }
@@ -573,7 +599,7 @@ class InstaMigrate {
 
     private function bridge_save_state($state) {
         @file_put_contents(INSTA_MIGRATE_BRIDGE_STATE_FILE, wp_json_encode($state, JSON_PRETTY_PRINT));
-        @chmod(INSTA_MIGRATE_BRIDGE_STATE_FILE, 0600);
+        self::chmod_safe(INSTA_MIGRATE_BRIDGE_STATE_FILE, 0600);
     }
 
     /**
@@ -893,9 +919,9 @@ class InstaMigrate {
      * Auth: bridge secret in JSON body or X-Bridge-Secret header.
      */
     public function route_bridge_tick(WP_REST_Request $request) {
-        ignore_user_abort(true);
-        @set_time_limit(300);
-        @ini_set('memory_limit', '512M');
+        self::ignore_user_abort_safe();
+        self::set_time_limit_safe(300);
+        self::ini_set_safe('memory_limit', '512M');
 
         $cfg = $this->bridge_load_config();
         if (!$cfg || empty($cfg['active'])) {
@@ -1543,6 +1569,12 @@ class InstaMigrate {
             'permission_callback' => [$this, 'check_auth'],
         ]);
 
+        register_rest_route($namespace, '/safe-activate', [
+            'methods'             => 'POST',
+            'callback'            => [$this, 'route_safe_activate'],
+            'permission_callback' => [$this, 'check_auth'],
+        ]);
+
         register_rest_route($namespace, '/theme/activate', [
             'methods'             => 'POST',
             'callback'            => [$this, 'theme_activate'],
@@ -1821,7 +1853,23 @@ class InstaMigrate {
             'wp_cli'       => $this->has_wp_cli(),
             'temp_dir'     => INSTA_MIGRATE_TEMP_DIR,
             'is_multisite' => is_multisite(),
+            // What this host can do (1.9.1) — lets the caller pick an archive format up front.
+            'capabilities' => [
+                'phar'          => class_exists('PharData'),
+                'zlib'          => function_exists('gzopen') || function_exists('gzopen64'),
+                'zip'           => class_exists('ZipArchive'),
+                'tar_reader'    => true,   // PAX / GNU / ustar long names, verified extraction
+                'safe_activate' => true,
+            ],
         ];
+        $fatal = get_option('insta_migrate_last_activation_fatal');
+        if (is_array($fatal)) {
+            $response['last_activation_fatal'] = $fatal;
+        }
+        $last = get_option('insta_migrate_last_safe_activate');
+        if (is_array($last)) {
+            $response['last_safe_activate'] = $last;
+        }
 
         if (is_multisite()) {
             $response['is_main_site']  = is_main_site();
@@ -1830,6 +1878,455 @@ class InstaMigrate {
         }
 
         return rest_ensure_response($response);
+    }
+
+    // ─── Route: Safe activate (1.9.1) ──────────────────────────────────────────────────────────
+    //
+    // POST /safe-activate — turn on ONE piece of site code and prove the site still works,
+    // undoing it automatically if it does not.
+    //
+    // Why. A migration that makes plugins active before their files are verified can take the
+    // whole destination down with one missing or incompatible file — and then every WordPress
+    // URL, including this plugin's own API, returns 500 and nothing can be repaired remotely
+    // (migration 42054fd5). The migration flow keeps code switched off until its files are
+    // verified, then switches each item on through this route:
+    //
+    //   kind=plugin    target=<dir/file.php>   activate_plugin() — WordPress loads the plugin file
+    //                                          BEFORE it records it as active, so a fatal on load
+    //                                          leaves the site exactly as it was.
+    //   kind=theme     target=<stylesheet>     switch_theme(); reverted to the previous theme.
+    //   kind=mu_plugin target=mu-plugins/<x>   from=<held path>  — moved into place by rename().
+    //   kind=dropin    target=<drop-in file>   from=<held path>  — object-cache.php etc.
+    //                  (mu-plugins and drop-ins load on every request whether "active" or not, so
+    //                  the caller keeps them under a held name until they pass this check.)
+    //
+    // The check needs POSITIVE proof that WordPress ran: the site's own "/" and "/?rest_route=/"
+    // are requested with a one-time token, and only a response carrying the header
+    // "X-InstaMigrate-Health: booted" — sent by this plugin on wp_loaded, with the canonical
+    // redirect switched off for that request so the theme's template really renders — counts as
+    // healthy. A 5xx, a recorded PHP fatal, or a PHP fatal / WordPress "critical error" message in
+    // the body counts as failing. Anything else — a proxy's http->https redirect, basic auth, a WAF
+    // block, a host that blocks loopback requests — is "unknown", never "ok". A failing check
+    // undoes the change; "unknown" keeps it unless revert_on_unknown=true. A site already failing
+    // before the change is refused with 409, and one call runs at a time (409 while locked).
+
+    /** Register the per-request recorder for a health-check request carrying our token. */
+    public function rest_no_store($response, $server, $request) {
+        if (is_object($request) && method_exists($request, 'get_route') && strpos((string) $request->get_route(), '/insta-migrate/') === 0
+            && is_object($response) && method_exists($response, 'header')) {
+            $response->header('Cache-Control', 'private, no-store, max-age=0');
+        }
+        return $response;
+    }
+
+    public function maybe_watch_health_request() {
+        if (empty($_SERVER['HTTP_X_INSTAMIGRATE_HEALTH'])) {
+            return;
+        }
+        $token = get_option('insta_migrate_health_token');
+        if (!is_string($token) || $token === '' || !hash_equals($token, (string) $_SERVER['HTTP_X_INSTAMIGRATE_HEALTH'])) {
+            return;
+        }
+        // Proof of life, and let the real page render instead of a canonical redirect (mid-migration
+        // home_url still names the SOURCE site, so "/" would otherwise always answer 301).
+        add_action('wp_loaded', function () {
+            if (!headers_sent()) {
+                header('X-InstaMigrate-Health: booted');
+            }
+        }, 0);
+        add_filter('redirect_canonical', '__return_false', 999);
+        $record = function ($error) {
+            static $done = false;
+            if ($done || !is_array($error) || !in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+                return;
+            }
+            $done = true;
+            $file = isset($error['file']) ? (string) $error['file'] : '';
+            if (strpos($file, ABSPATH) === 0) {
+                $file = substr($file, strlen(ABSPATH));
+            }
+            update_option('insta_migrate_health_fatal', [
+                'message' => substr((string) $error['message'], 0, 1000),
+                'file'    => $file,
+                'line'    => isset($error['line']) ? (int) $error['line'] : 0,
+                'at'      => time(),
+            ], false);
+        };
+        // WordPress's own fatal handler (5.2+) ends the request with wp_die() from ITS shutdown
+        // function, so a shutdown function registered after it would never run. Its message filter
+        // receives the error and runs first; the shutdown function covers sites that disable it.
+        add_filter('wp_php_error_message', function ($message, $error) use ($record) {
+            $record($error);
+            return $message;
+        }, 10, 2);
+        register_shutdown_function(function () use ($record) {
+            $record(error_get_last());
+        });
+    }
+
+    /** The base URL the site answers on, for the loopback health check. */
+    private function health_base_url(WP_REST_Request $request) {
+        $hosts = [];
+        foreach ([home_url(), site_url()] as $u) {
+            $h = parse_url($u, PHP_URL_HOST);
+            if ($h) { $hosts[] = strtolower($h); }
+        }
+        $req_host = isset($_SERVER['HTTP_HOST']) ? strtolower(preg_replace('/:\d+$/', '', (string) $_SERVER['HTTP_HOST'])) : '';
+        if ($req_host !== '') { $hosts[] = $req_host; }
+
+        $given = (string) $request->get_param('check_url');
+        if ($given !== '') {
+            $p = parse_url($given);
+            // Only this site's own hosts: the route must never become a request-anything proxy.
+            if (empty($p['scheme']) || !in_array($p['scheme'], ['http', 'https'], true) || empty($p['host'])
+                || !in_array(strtolower($p['host']), $hosts, true)) {
+                return new WP_Error('invalid_check_url', 'check_url must be this site\'s own http(s) address.', ['status' => 400]);
+            }
+            return rtrim($p['scheme'] . '://' . $p['host'] . (isset($p['port']) ? ':' . $p['port'] : ''), '/');
+        }
+        // Default: the address this request arrived on. home_url() is wrong mid-migration — it still
+        // names the SOURCE site until search-replace runs. Behind a TLS-terminating proxy is_ssl()
+        // is false, so trust the proxy's own scheme header too.
+        if (isset($_SERVER['HTTP_HOST']) && $_SERVER['HTTP_HOST'] !== '') {
+            $https = is_ssl() || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https');
+            return ($https ? 'https' : 'http') . '://' . $_SERVER['HTTP_HOST'];
+        }
+        return rtrim(home_url(), '/');
+    }
+
+    /**
+     * Request the front page and the REST index once each.
+     * 'ok'      = every reached check carried the "booted" proof header and no fatal was recorded;
+     * 'failing' = any check answered 5xx, recorded a PHP fatal, or (without proof) showed one;
+     * 'unknown' = WordPress could not be shown to have run (no proof, no failure).
+     */
+    private function health_check($base) {
+        $token = wp_generate_password(32, false, false);
+        update_option('insta_migrate_health_token', $token, false);
+        $this->health_fatal_clear();
+        $out = ['state' => 'unknown', 'checks' => []];
+        $ok = 0;
+        $failing = 0;
+        foreach (['/', '/?rest_route=/'] as $path) {
+            $url = $base . $path . (strpos($path, '?') === false ? '?' : '&') . 'instamigrate_health=' . $token;
+            $args = [
+                'timeout'     => 10,
+                'redirection' => 0,
+                'sslverify'   => false,
+                'user-agent'  => 'InstaWP/1.0 (https://instawp.com; support@instawp.com)',
+                'headers'     => ['Cache-Control' => 'no-cache', 'X-InstaMigrate-Health' => $token],
+            ];
+            $r = wp_remote_get($url, $args);
+            // One redirect to the SAME host (a proxy's http -> https) is followed; anything else is not.
+            if (!is_wp_error($r) && in_array((int) wp_remote_retrieve_response_code($r), [301, 302, 307, 308], true)) {
+                $loc = (string) wp_remote_retrieve_header($r, 'location');
+                if ($loc !== '' && strtolower((string) parse_url($loc, PHP_URL_HOST)) === strtolower((string) parse_url($base, PHP_URL_HOST))) {
+                    $r = wp_remote_get($loc, $args);
+                }
+            }
+            if (is_wp_error($r)) {
+                $out['checks'][] = ['url' => $path, 'error' => $r->get_error_message()];
+                break; // the second probe would only wait out the same timeout
+            }
+            $code   = (int) wp_remote_retrieve_response_code($r);
+            $booted = (wp_remote_retrieve_header($r, 'x-instamigrate-health') === 'booted');
+            $body   = substr((string) wp_remote_retrieve_body($r), 0, 65536);
+            $marker = (bool) preg_match('/There has been a critical error on (this|your) website|<b>(Fatal|Parse) error<\/b>:|^(PHP )?(Fatal|Parse) error: /mi', $body);
+            $out['checks'][] = ['url' => $path, 'status' => $code, 'booted' => $booted, 'fatal_in_body' => $marker];
+            // A fatal message in the body counts even WITH the proof header: a template that crashes
+            // after wp_loaded on a display_errors host answers "200 + booted + fatal text".
+            if ($code >= 500 || $marker) {
+                $failing++;
+            } elseif ($booted) {
+                $ok++;
+            }
+        }
+        $fatal = $this->health_fatal_read();
+        if (is_array($fatal)) {
+            $out['fatal'] = $fatal;
+            $failing++; // the recorder only writes this for a real PHP fatal in a check request
+        }
+        if ($failing > 0) {
+            $out['state'] = 'failing';
+        } elseif ($ok > 0 && $ok === count($out['checks'])) {
+            $out['state'] = 'ok';
+        }
+        delete_option('insta_migrate_health_token');
+        return $out;
+    }
+
+    /**
+     * The recorded fatal is written by ANOTHER request (the loopback check), so this request's option
+     * cache cannot be trusted: the baseline check already looked it up, found nothing, and WordPress
+     * remembered "not set" in `notoptions` — every later get_option() then answered from that cache
+     * and the culprit was never seen (found by QA on a live sandbox, 2026-10-29). Read and clear the
+     * row in the database directly, and drop any cached copy.
+     */
+    private function health_fatal_read() {
+        global $wpdb;
+        wp_cache_delete('insta_migrate_health_fatal', 'options');
+        wp_cache_delete('notoptions', 'options');
+        $raw = $wpdb->get_var($wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", 'insta_migrate_health_fatal'));
+        if ($raw === null) {
+            return null;
+        }
+        $v = maybe_unserialize($raw);
+        return is_array($v) ? $v : null;
+    }
+
+    private function health_fatal_clear() {
+        global $wpdb;
+        $wpdb->delete($wpdb->options, ['option_name' => 'insta_migrate_health_fatal']);
+        wp_cache_delete('insta_migrate_health_fatal', 'options');
+        wp_cache_delete('notoptions', 'options');
+    }
+
+    /** Resolve a wp-content-relative path (realpath-confined), or false if it leaves wp-content. */
+    private function content_relative_path($rel, $must_exist) {
+        $rel = ltrim(str_replace('\\', '/', (string) $rel), '/');
+        if ($rel === '' || strpos($rel, "\0") !== false || preg_match('#(^|/)\.\.(/|$)#', $rel)) {
+            return false;
+        }
+        $root = realpath($this->content_dir());
+        $path = rtrim($this->content_dir(), '/') . '/' . $rel;
+        $real = realpath($must_exist ? $path : dirname($path));
+        if ($root === false || $real === false || strpos($real . '/', rtrim($root, '/') . '/') !== 0) {
+            return false;
+        }
+        return $path;
+    }
+
+    /** Drop-in files WordPress loads on its own. */
+    private static function dropin_names() {
+        return ['advanced-cache.php', 'object-cache.php', 'db.php', 'db-error.php', 'install.php',
+                'maintenance.php', 'php-error.php', 'fatal-error-handler.php', 'sunrise.php',
+                'blog-deleted.php', 'blog-inactive.php', 'blog-suspended.php'];
+    }
+
+    public function route_safe_activate(WP_REST_Request $request) {
+        self::set_time_limit_safe(120);
+        // The caller may give up (proxy timeouts) while the change is still being checked; finish
+        // the job either way, and leave the outcome where /status can show it.
+        self::ignore_user_abort_safe();
+
+        $kind   = (string) $request->get_param('kind');
+        $target = (string) $request->get_param('target');
+        $revert_on_unknown = filter_var($request->get_param('revert_on_unknown'), FILTER_VALIDATE_BOOLEAN);
+        if (!in_array($kind, ['plugin', 'theme', 'mu_plugin', 'dropin'], true) || $target === '') {
+            return new WP_Error('invalid_params', 'Provide kind (plugin, theme, mu_plugin or dropin) and target.', ['status' => 400]);
+        }
+        $base = $this->health_base_url($request);
+        if (is_wp_error($base)) {
+            return $base;
+        }
+
+        // One call at a time: concurrent calls would share the health token and blame each other.
+        $lock = get_option('insta_migrate_safe_activate_lock');
+        if ($lock && (int) $lock > time() - 180) {
+            return new WP_Error('busy', 'Another safe-activate call is in progress; retry shortly.', ['status' => 409]);
+        }
+        if ($lock) {
+            delete_option('insta_migrate_safe_activate_lock'); // stale (a crashed call): take over
+        }
+        if (!add_option('insta_migrate_safe_activate_lock', time(), '', 'no')) {
+            return new WP_Error('busy', 'Another safe-activate call is in progress; retry shortly.', ['status' => 409]);
+        }
+        // A plugin that crashes while WordPress loads it ends this request with a fatal, which skips
+        // `finally`. Release the lock from WordPress's fatal handler (its message filter runs before it
+        // exits) and from a shutdown function for sites that disable that handler.
+        $release = function () {
+            delete_option('insta_migrate_safe_activate_lock');
+        };
+        add_filter('wp_php_error_message', function ($message) use ($release) {
+            $release();
+            return $message;
+        }, 5);
+        register_shutdown_function($release);
+        try {
+            $result = $this->safe_activate_locked($kind, $target, $base, $revert_on_unknown, $request);
+        } finally {
+            delete_option('insta_migrate_safe_activate_lock');
+        }
+        $summary = is_wp_error($result)
+            ? ['ok' => false, 'code' => $result->get_error_code(), 'message' => $result->get_error_message()]
+            : ['ok' => true];
+        update_option('insta_migrate_last_safe_activate', array_merge(
+            ['kind' => $kind, 'target' => $target, 'at' => time()], $summary), false);
+        return $result;
+    }
+
+    private function safe_activate_locked($kind, $target, $base, $revert_on_unknown, WP_REST_Request $request) {
+        // Refuse to act on a site that is already failing: the culprit would be misattributed.
+        $before = $this->health_check($base);
+        if ($before['state'] === 'failing') {
+            return new WP_Error('site_unhealthy_before',
+                'The site already returns server errors before this change; nothing was changed.',
+                ['status' => 409, 'health_before' => $before]);
+        }
+
+        $undo  = null;   // closure that reverses the change; returns true when it fully succeeded
+        $label = '';
+        $previous_kept = null;
+        if ($kind === 'plugin') {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+            if (!preg_match('#^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?\.php$#', $target)) {
+                return new WP_Error('invalid_params', 'target must be a plugin file such as "akismet/akismet.php".', ['status' => 400]);
+            }
+            if (is_plugin_active($target)) {
+                return rest_ensure_response(['success' => true, 'skipped' => true, 'kind' => $kind, 'target' => $target,
+                    'message' => 'Plugin is already active — no change made.', 'health' => $before]);
+            }
+            $valid = validate_plugin($target);
+            if (is_wp_error($valid)) {
+                return new WP_Error('invalid_plugin', $valid->get_error_message(), ['status' => 422]);
+            }
+            // Drop-ins that exist now; any NEW one after activation was written by the plugin's own
+            // activation hook (caching plugins do this) and is switched off again on revert.
+            $content = rtrim($this->content_dir(), '/');
+            $dropins_before = [];
+            foreach (self::dropin_names() as $d) {
+                $dropins_before[$d] = file_exists("$content/$d");
+            }
+            // A fatal while WordPress loads the plugin ends THIS request before the plugin is marked
+            // active (so the site is unchanged); remember it so the caller can read why in /status.
+            delete_option('insta_migrate_last_activation_fatal');
+            update_option('insta_migrate_activating', ['target' => $target, 'at' => time()], false);
+            $record_activation = function ($e) use ($target) {
+                if (!get_option('insta_migrate_activating')) {
+                    return;
+                }
+                if (is_array($e) && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+                    $file = (string) $e['file'];
+                    if (strpos($file, ABSPATH) === 0) {
+                        $file = substr($file, strlen(ABSPATH));
+                    }
+                    update_option('insta_migrate_last_activation_fatal', [
+                        'target' => $target, 'message' => substr((string) $e['message'], 0, 1000),
+                        'file' => $file, 'line' => (int) $e['line'], 'at' => time()], false);
+                }
+                delete_option('insta_migrate_activating');
+            };
+            add_filter('wp_php_error_message', function ($message, $error) use ($record_activation) {
+                $record_activation($error);
+                return $message;
+            }, 6, 2);
+            register_shutdown_function(function () use ($record_activation) {
+                $record_activation(error_get_last());
+            });
+            ob_start();
+            $r = activate_plugin($target, '', false, false);
+            ob_end_clean();
+            delete_option('insta_migrate_activating');
+            if (is_wp_error($r)) {
+                return new WP_Error('activation_failed', $r->get_error_message(), ['status' => 422]);
+            }
+            $undo = function () use ($target, $content, $dropins_before) {
+                // Silent: the plugin's own deactivation hook could crash this request, which would
+                // leave it ACTIVE. New drop-ins it created are moved aside instead.
+                deactivate_plugins($target, true);
+                $ok = !is_plugin_active($target);
+                foreach ($dropins_before as $d => $existed) {
+                    if (!$existed && file_exists("$content/$d")) {
+                        $ok = @rename("$content/$d", "$content/$d.instamigrate-disabled-" . time()) && $ok;
+                    }
+                }
+                return $ok;
+            };
+            $label = 'plugin';
+        } elseif ($kind === 'theme') {
+            if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]*$/', $target)) {
+                return new WP_Error('invalid_params', 'target must be a theme directory name.', ['status' => 400]);
+            }
+            $theme = wp_get_theme($target);
+            if (!$theme->exists() || $theme->errors()) {
+                $why = $theme->errors() ? $theme->errors()->get_error_message() : 'not installed';
+                return new WP_Error('invalid_theme', "Theme $target cannot be activated: $why", ['status' => 422]);
+            }
+            $previous = get_stylesheet();
+            if ($previous === $target) {
+                return rest_ensure_response(['success' => true, 'skipped' => true, 'kind' => $kind, 'target' => $target,
+                    'message' => 'Theme is already active — no change made.', 'health' => $before]);
+            }
+            // switch_theme() and the next request's check_theme_switched() remap widgets; keep the
+            // originals so a revert puts them back exactly.
+            $widgets  = get_option('sidebars_widgets');
+            $switched = get_option('theme_switched');
+            switch_theme($target);
+            $undo = function () use ($previous, $widgets, $switched) {
+                switch_theme($previous);
+                update_option('sidebars_widgets', $widgets);
+                if ($switched === false) { delete_option('theme_switched'); } else { update_option('theme_switched', $switched); }
+                return get_stylesheet() === $previous;
+            };
+            $label = 'theme';
+        } else {
+            // mu_plugin / dropin: move a held file (or folder) into the place WordPress loads it from.
+            $rel  = ltrim(str_replace('\\', '/', $target), '/');
+            if ($kind === 'mu_plugin' && !is_dir(rtrim($this->content_dir(), '/') . '/mu-plugins')) {
+                wp_mkdir_p(rtrim($this->content_dir(), '/') . '/mu-plugins');
+            }
+            $from = $this->content_relative_path($request->get_param('from'), true);
+            $to   = $this->content_relative_path($rel, false);
+            if ($kind === 'mu_plugin' && !preg_match('#^mu-plugins/[^/]+$#', $rel)) {
+                return new WP_Error('invalid_params', 'A mu_plugin target must be mu-plugins/<name>.', ['status' => 400]);
+            }
+            if ($kind === 'dropin' && !in_array($rel, self::dropin_names(), true)) {
+                return new WP_Error('invalid_params', 'A dropin target must be a WordPress drop-in file name.', ['status' => 400]);
+            }
+            $from_rel = ltrim(str_replace('\\', '/', (string) $request->get_param('from')), '/');
+            if ($from === false || $to === false || in_array(rtrim($from_rel, '/'), ['plugins', 'themes', 'uploads', 'mu-plugins', 'languages'], true)) {
+                return new WP_Error('invalid_params', 'from must be an existing held file or folder inside wp-content.', ['status' => 400]);
+            }
+            $aside = null;
+            if (file_exists($to)) {
+                $aside = $to . '.instamigrate-prev-' . time();
+                if (!@rename($to, $aside)) {
+                    return new WP_Error('move_failed', "Could not move the existing $rel aside.", ['status' => 500]);
+                }
+            }
+            if (!@rename($from, $to)) {
+                if ($aside) { @rename($aside, $to); }
+                return new WP_Error('move_failed', "Could not move the held copy into $rel.", ['status' => 500]);
+            }
+            $undo = function () use ($from, $to, $aside) {
+                $ok = @rename($to, $from);
+                if ($ok && $aside) {
+                    $ok = @rename($aside, $to);
+                }
+                return $ok;
+            };
+            $label = $kind;
+            $previous_kept = $aside ? substr($aside, strlen(rtrim($this->content_dir(), '/')) + 1) : null;
+        }
+
+        $after = $this->health_check($base);
+        $revert = ($after['state'] === 'failing') || ($after['state'] === 'unknown' && $revert_on_unknown);
+        if ($revert) {
+            $undone   = (bool) $undo();
+            $restored = $this->health_check($base);
+            if (!$undone || $restored['state'] === 'failing') {
+                return new WP_Error('revert_failed',
+                    "Switching on this $label broke the site and switching it off again did not fully restore it. A person needs to look at the site.",
+                    ['status' => 500, 'kind' => $kind, 'target' => $target, 'reverted' => $undone,
+                     'site_state' => $restored['state'], 'health_after' => $after, 'health_restored' => $restored]);
+            }
+            return new WP_Error('activation_broke_site',
+                ($after['state'] === 'failing'
+                    ? "Switching on this $label made the site fail, so it was switched off again."
+                    : "The site could not be checked after switching on this $label, so it was switched off again."),
+                ['status' => 422, 'kind' => $kind, 'target' => $target, 'reverted' => true,
+                 'site_state' => $restored['state'], 'health_after' => $after, 'health_restored' => $restored]);
+        }
+
+        $data = ['success' => true, 'kind' => $kind, 'target' => $target, 'health' => $after];
+        if ($after['state'] === 'unknown') {
+            $data['warning'] = 'WordPress could not be shown to have loaded after the change (the site may block requests to itself); the change was kept.';
+        }
+        if ($previous_kept !== null) {
+            $data['previous_copy'] = $previous_kept;
+        }
+        return rest_ensure_response($data);
     }
 
     // ─── Route: Disk Usage ───────────────────────────────────────
@@ -2104,7 +2601,7 @@ class InstaMigrate {
                 }
             }
 
-            @set_time_limit($budget + 30);
+            self::set_time_limit_safe($budget + 30);
             $state['skip_real'] = @realpath(INSTA_MIGRATE_TEMP_DIR);
 
             $upload_dir = wp_upload_dir();
@@ -2249,8 +2746,8 @@ class InstaMigrate {
      *   fits=null   — the time budget elapsed before finishing and before any error → indeterminate
      */
     public function route_disk_probe(WP_REST_Request $request) {
-        ignore_user_abort(true);
-        @set_time_limit(60);
+        self::ignore_user_abort_safe();
+        self::set_time_limit_safe(60);
 
         $requested = (int) $request->get_param('bytes');
         if ($requested <= 0) {
@@ -2507,10 +3004,13 @@ class InstaMigrate {
                 }
                 $zip->close();
                 $present = 0;
+                $absent  = [];
                 foreach ($files as $rel) {
                     if (file_exists(rtrim($dest, '/') . '/' . ltrim($rel, '/'))) { $present++; }
+                    elseif (count($absent) < 100) { $absent[] = $rel; }
                 }
-                return ['archive_entries' => count($files), 'present' => $present, 'missing' => count($files) - $present];
+                return ['archive_entries' => count($files), 'present' => $present, 'missing' => count($files) - $present,
+                        'missing_paths' => $absent];
             }
             $phar = new PharData($archive);
             $n = 0;
@@ -2524,8 +3024,8 @@ class InstaMigrate {
     public function route_db_import(WP_REST_Request $request) {
         global $wpdb;
 
-        @set_time_limit(600);
-        @ini_set('memory_limit', '512M');
+        self::set_time_limit_safe(600);
+        self::ini_set_safe('memory_limit', '512M');
 
         $wp_filesystem = $this->init_filesystem();
         $files = $request->get_file_params();
@@ -2839,7 +3339,7 @@ class InstaMigrate {
     // ─── Route: File Upload ──────────────────────────────────────
 
     public function route_files_upload(WP_REST_Request $request) {
-        @set_time_limit(300);
+        self::set_time_limit_safe(300);
 
         $wp_filesystem = $this->init_filesystem();
         $files = $request->get_file_params();
@@ -2886,8 +3386,8 @@ class InstaMigrate {
     // ─── Route: File Extract ─────────────────────────────────────
 
     public function route_files_extract(WP_REST_Request $request) {
-        @set_time_limit(600);
-        @ini_set('memory_limit', '512M');
+        self::set_time_limit_safe(600);
+        self::ini_set_safe('memory_limit', '512M');
 
         $archive_path = $request->get_param('archive_path');
         // `extract_to` accepted as an alias: callers reached for that name, and an unrecognised
@@ -2964,28 +3464,50 @@ class InstaMigrate {
         $ext = strtolower(pathinfo($archive_path, PATHINFO_EXTENSION));
         $filename = basename($archive_path);
 
-        // Detect tar.gz / tgz
-        if ($ext === 'gz' || $ext === 'tgz' || strpos($filename, '.tar.gz') !== false) {
-            $result = $this->extract_tar_gz($archive_path, $dest_dir); $vext = 'tar';
+        // Detect tar.gz / tgz. Tar archives are always pre-checked, extracted and verified
+        // (extract_tar_verified, 1.9.1); zip archives are always verified below.
+        if ($ext === 'gz' || $ext === 'tgz' || strpos($filename, '.tar.gz') !== false || $ext === 'tar') {
+            $result = $this->extract_tar_verified($archive_path, $dest_dir); $vext = 'tar';
         } elseif ($ext === 'zip') {
             $result = $this->extract_zip($archive_path, $dest_dir); $vext = 'zip';
-        } elseif ($ext === 'tar') {
-            $result = $this->extract_tar($archive_path, $dest_dir); $vext = 'tar';
         } else {
             if ($pulled) { wp_delete_file($pulled); }
             return new WP_Error('unknown_format', "Unknown archive format: $ext", ['status' => 400]);
         }
 
-        // Optional post-extract verification (v1.7.6): count archive entries missing under
-        // dest so a silent truncation surfaces as complete:false instead of a false success.
-        if ($request->get_param('verify') && !is_wp_error($result)) {
-            $v = $this->verify_extracted($archive_path, $dest_dir, $vext);
-            if ($v) {
+        // Zip verification (v1.7.6, always on since 1.9.1): count archive entries missing under
+        // dest. ZipArchive can stop early at a PHP limit while extractTo() looks successful, so an
+        // incomplete zip extract is an error, never a success. Tar verifies inside
+        // extract_tar_verified(). `verify` is still accepted and now has no effect.
+        if ($vext === 'zip' && !is_wp_error($result)) {
+            $v = $this->verify_extracted($archive_path, $dest_dir, 'zip');
+            $repaired = 0;
+            if ($v && $v['missing'] > 0) {
+                // Repair: ZipArchive::extractTo() on some PHP builds drops a LEADING non-ASCII
+                // character from a file name ("ünïcødé.webp" lands as "nïcødé.webp"; seen on
+                // PHP 5.6/7.4 with libzip 1.7). getStream() still reads the entry by its true name,
+                // so write those entries ourselves, then verify again.
+                $repaired = $this->zip_repair($archive_path, $dest_dir);
+                $v = $this->verify_extracted($archive_path, $dest_dir, 'zip');
+            }
+            if (!$v) {
+                $data = $result->get_data();
+                $data['complete'] = null; // the archive could not be re-opened to verify it
+                $result->set_data($data);
+            } else {
                 $data = $result->get_data();
                 $data['archive_entries'] = $v['archive_entries'];
                 $data['missing']  = $v['missing'];
-                $data['complete'] = ($v['missing'] === null) ? true : ($v['missing'] === 0);
-                $result->set_data($data);
+                $data['complete'] = ($v['missing'] === 0);
+                $data['repaired'] = $repaired;
+                if ($v['missing'] > 0) {
+                    $result = new WP_Error('extract_incomplete',
+                        $v['missing'] . ' of ' . $v['archive_entries'] . ' files did not extract.',
+                        ['status' => 422, 'method' => 'ziparchive', 'archive_entries' => $v['archive_entries'],
+                         'missing' => $v['missing'], 'missing_paths' => $v['missing_paths']]);
+                } else {
+                    $result->set_data($data);
+                }
             }
         }
 
@@ -3002,6 +3524,534 @@ class InstaMigrate {
         return $result;
     }
 
+    // ─── Tar reading: pre-check, PharData + repair, verification (1.9.1) ───────────────────────
+    //
+    // Why this exists. PharData (the only tar reader PHP ships) does not understand PAX extended
+    // headers — what Python's tarfile and bsdtar write for any path longer than 100 bytes. It
+    // writes those entries under the header's TRUNCATED name and reports success. Measured
+    // identically on PHP 5.6 through 8.4. /files/extract then answered success over an incomplete
+    // plugin, the next request require_once'd a file that was not there, and the destination
+    // fataled on every URL, InstaMigrate's own routes included (migration 42054fd5, 2026-10-27/28).
+    // PharData also loads the WHOLE archive into memory (measured 1.3-1.6x the uncompressed size),
+    // and running out of memory_limit mid-way is an uncatchable fatal half-way through a folder.
+    //
+    // What happens now, for every .tar / .tar.gz:
+    //   1. PRE-CHECK  — tar_scan('list') reads only the headers. A damaged or truncated archive, an
+    //      unsafe path (absolute, '..', NUL), not enough disk space or an unwritable destination
+    //      refuses the request before ONE byte is written.
+    //   2. EXTRACT    — PharData exactly as before (so every archive that worked still behaves the
+    //      same), unless the pre-check found PAX long names, links or special files, or the archive
+    //      is too big for PharData within memory_limit: then tar_scan('extract') does it all.
+    //   3. VERIFY     — every regular file (and hard link) must exist with its declared size.
+    //   4. REPAIR     — anything missing is written by tar_scan('extract', only those paths).
+    //   5. VERIFY     — still missing => HTTP 422 extract_incomplete with the paths. Never success.
+
+    /** Guarded chmod/touch: on PHP 8 a function in disable_functions is a fatal `@` cannot stop. */
+    private static function chmod_safe($path, $mode) {
+        if (function_exists('chmod')) { @chmod($path, $mode); }
+    }
+
+    private static function touch_safe($path, $mtime) {
+        if (function_exists('touch')) { @touch($path, $mtime); }
+    }
+
+    /**
+     * Open a tar for reading. gzip is detected from the file's magic bytes (1f 8b), not its
+     * extension, so a gzipped file named ".tar" is still read correctly. Some PHP builds only
+     * expose gzopen64().
+     */
+    private function tar_open_read($path) {
+        $h = @fopen($path, 'rb');
+        if (!$h) {
+            return [false, false];
+        }
+        $magic = fread($h, 2);
+        if ($magic !== "\x1f\x8b") {
+            rewind($h);
+            return [$h, false];
+        }
+        fclose($h);
+        if (function_exists('gzopen')) {
+            $h = @gzopen($path, 'rb');
+        } elseif (function_exists('gzopen64')) {
+            $h = @gzopen64($path, 'rb');
+        } else {
+            throw new RuntimeException('zlib_unavailable: this PHP cannot read .gz archives');
+        }
+        return $h ? [$h, true] : [false, true];
+    }
+
+    /** True when a path component would mean something other than a file name on this server. */
+    private static function tar_path_unsafe($rel) {
+        if ($rel[0] === '/' || strpos($rel, "\0") !== false || preg_match('#(^|/)\.\.(/|$)#', $rel)) {
+            return true;
+        }
+        // Backslashes and "X:" are ordinary file-name characters on Linux; only Windows reads them as paths.
+        return DIRECTORY_SEPARATOR === '\\' && (strpos($rel, '\\') !== false || preg_match('#^[A-Za-z]:#', $rel));
+    }
+
+    /** Normalise an archive path: collapse slashes, drop "./" prefixes and trailing "/". */
+    private static function tar_norm($name) {
+        $rel = preg_replace('#/+#', '/', $name);
+        while (strpos($rel, './') === 0) {
+            $rel = substr($rel, 2);
+        }
+        return rtrim($rel, '/');
+    }
+
+    /**
+     * Stream a tar archive one 512-byte block at a time.
+     *
+     * $mode 'list'    → read headers only; returns the entry list. Writes nothing.
+     * $mode 'extract' → also write entries under $dest. With $only (array path => true), write
+     *                   just those files (the repair pass).
+     *
+     * Understands every long-name encoding a real tar uses: POSIX ustar prefix+name (only when the
+     * magic is "ustar\0" — GNU's "ustar  \0" uses that area for other fields), PAX 'x' records
+     * (path, linkpath, size, mtime; applying to the next entry; 'g' globals are skipped) and GNU
+     * 'L' / 'K' long names. Every header's checksum is verified, and an archive that ends without
+     * its end-of-archive marker is treated as truncated.
+     *
+     * Returns ['files' => [path => size], 'hardlinks' => [path => target], 'dirs' => int,
+     *          'skipped' => [paths of symlinks/devices], 'unsafe' => [raw paths], 'pax_names' => int,
+     *          'bytes' => int, 'written' => int, 'failed' => [paths]].
+     * Throws RuntimeException('not_tar: …') when the FIRST header is invalid, and
+     * RuntimeException('corrupt: …') on a truncated or malformed archive.
+     */
+    private function tar_scan($archive, $mode, $dest = '', $only = null) {
+        list($h, $gz) = $this->tar_open_read($archive);
+        if (!$h) {
+            throw new RuntimeException('corrupt: cannot open archive');
+        }
+        $read = function ($n) use ($h, $gz) {
+            $buf = '';
+            while (strlen($buf) < $n) {
+                $chunk = $gz ? gzread($h, $n - strlen($buf)) : fread($h, $n - strlen($buf));
+                if ($chunk === false || $chunk === '') {
+                    break;
+                }
+                $buf .= $chunk;
+            }
+            return $buf;
+        };
+        $skip = function ($n) use ($read, $h, $gz) {
+            if ($n <= 0) {
+                return;
+            }
+            if (!$gz) {
+                // Plain tar: seek, then prove the bytes exist (a seek past EOF does not fail).
+                $pos = ftell($h);
+                if (fseek($h, $n, SEEK_CUR) === 0) {
+                    $st = fstat($h);
+                    if ($st && ftell($h) <= $st['size']) {
+                        return;
+                    }
+                }
+                throw new RuntimeException('corrupt: archive ends inside an entry');
+            }
+            while ($n > 0) {
+                $got = strlen($read(min($n, 1048576)));
+                if ($got === 0) {
+                    throw new RuntimeException('corrupt: archive ends inside an entry');
+                }
+                $n -= $got;
+            }
+        };
+        $num = function ($field) {
+            // GNU base-256 (sizes of 8 GiB and up): the first byte has its high bit set.
+            if ($field !== '' && (ord($field[0]) & 0x80)) {
+                $v = ord($field[0]) & 0x7f;
+                for ($i = 1, $l = strlen($field); $i < $l; $i++) {
+                    $v = $v * 256 + ord($field[$i]);
+                }
+                return $v;
+            }
+            $s = trim(str_replace("\0", ' ', $field));
+            return ($s === '' || !preg_match('/^[0-7]+$/', $s)) ? 0 : octdec($s);
+        };
+        $cstr = function ($field) {
+            return substr($field, 0, strcspn($field, "\0")); // a C string: everything up to the first NUL
+        };
+
+        $dest  = rtrim((string) $dest, '/');
+        $out   = ['files' => [], 'hardlinks' => [], 'dirs' => 0, 'skipped' => [], 'unsafe' => [],
+                  'pax_names' => 0, 'bytes' => 0, 'written' => 0, 'failed' => []];
+        $fmode = defined('FS_CHMOD_FILE') ? FS_CHMOD_FILE : 0644;
+        $long_name = null;
+        $long_link = null;
+        $pax   = [];
+        $first = true;
+        $zeros = 0;
+        $META_MAX = 1048576; // a long-name / PAX record larger than this is not a real archive
+
+        try {
+            while (true) {
+                $hdr = $read(512);
+                if ($hdr === '') {
+                    // Every tar writer ends with zero blocks. EOF without one means the archive was
+                    // cut short exactly on an entry boundary (e.g. a lost final upload chunk).
+                    if ($zeros === 0) {
+                        throw new RuntimeException(($first ? 'not_tar' : 'corrupt') . ': archive ends without its end-of-archive marker (truncated)');
+                    }
+                    break;
+                }
+                if (strlen($hdr) < 512) {
+                    throw new RuntimeException('corrupt: short header');
+                }
+                if (trim($hdr, "\0") === '') {
+                    if (++$zeros >= 2) {
+                        break;
+                    }
+                    continue;
+                }
+                $zeros = 0;
+
+                $sum = 0;
+                for ($i = 0; $i < 512; $i++) {
+                    $sum += ($i >= 148 && $i < 156) ? 32 : ord($hdr[$i]);
+                }
+                if ($sum !== (int) $num(substr($hdr, 148, 8))) {
+                    throw new RuntimeException(($first ? 'not_tar' : 'corrupt') . ': header checksum mismatch');
+                }
+                $first = false;
+
+                $type = $hdr[156];
+                $size = $num(substr($hdr, 124, 12));
+                $name = $cstr(substr($hdr, 0, 100));
+                $link = $cstr(substr($hdr, 157, 100));
+                if (substr($hdr, 257, 6) === "ustar\0") {
+                    $prefix = $cstr(substr($hdr, 345, 155));
+                    if ($prefix !== '') {
+                        $name = $prefix . '/' . $name;
+                    }
+                }
+
+                // Metadata entries that describe the NEXT entry.
+                if ($type === 'L' || $type === 'K' || $type === 'x' || $type === 'g') {
+                    if ($size > $META_MAX) {
+                        throw new RuntimeException('corrupt: oversized long-name/PAX record');
+                    }
+                    $data = $size > 0 ? $read($size) : '';
+                    if (strlen($data) < $size) {
+                        throw new RuntimeException('corrupt: archive ends inside a header record');
+                    }
+                    $skip((512 - $size % 512) % 512);
+                    if ($type === 'L') {
+                        $long_name = $cstr($data);
+                    } elseif ($type === 'K') {
+                        $long_link = $cstr($data);
+                    } elseif ($type === 'x') {
+                        $pax = [];
+                        $pos = 0;
+                        $dl  = strlen($data);
+                        while ($pos < $dl) {
+                            $sp = strpos($data, ' ', $pos);
+                            if ($sp === false) {
+                                break;
+                            }
+                            $len = (int) substr($data, $pos, $sp - $pos);
+                            if ($len <= 0) {
+                                break;
+                            }
+                            $rec = substr($data, $sp + 1, $len - ($sp - $pos) - 2); // drop "\n"
+                            $eq  = strpos($rec, '=');
+                            if ($eq !== false) {
+                                $pax[substr($rec, 0, $eq)] = substr($rec, $eq + 1);
+                            }
+                            $pos += $len;
+                        }
+                    }
+                    continue;
+                }
+
+                if ($long_name !== null) {
+                    $name = $long_name;
+                }
+                if (isset($pax['path']) && $pax['path'] !== $name) {
+                    $name = $pax['path'];
+                    $out['pax_names']++; // PharData would write this entry under the header's short name
+                }
+                if ($long_link !== null) {
+                    $link = $long_link;
+                }
+                if (isset($pax['linkpath'])) {
+                    $link = $pax['linkpath'];
+                }
+                if (isset($pax['size']) && preg_match('/^[0-9]+$/', $pax['size'])) {
+                    $size = (int) $pax['size'];
+                }
+                $mtime = isset($pax['mtime']) ? (int) $pax['mtime'] : (int) $num(substr($hdr, 136, 12));
+                $long_name = null;
+                $long_link = null;
+                $pax = [];
+                $pad = (512 - $size % 512) % 512;
+                $out['bytes'] += 1024 + $size;
+
+                $rel = self::tar_norm($name);
+                if ($rel === '' || $rel === '.') {
+                    $skip($size + $pad);
+                    continue;
+                }
+                if (self::tar_path_unsafe($rel)) {
+                    $out['unsafe'][] = $name;
+                    $skip($size + $pad);
+                    continue;
+                }
+
+                if ($type === '5') {
+                    $out['dirs']++;
+                    if ($mode === 'extract' && $only === null) {
+                        $target = $dest . '/' . $rel;
+                        if (!is_dir($target) && !wp_mkdir_p($target)) {
+                            $out['failed'][] = $rel . '/';
+                        }
+                    }
+                    $skip($size + $pad);
+                    continue;
+                }
+                if ($type === '1') {
+                    // Hard link: a second name for a file earlier in the archive (GNU tar's default
+                    // for hard-linked files). Restored as a copy of that file.
+                    $t = self::tar_norm($link);
+                    if ($t === '' || self::tar_path_unsafe($t)) {
+                        $out['unsafe'][] = $name . ' -> ' . $link;
+                        $skip($size + $pad);
+                        continue;
+                    }
+                    $out['hardlinks'][$rel] = $t;
+                    if ($mode === 'extract' && ($only === null || isset($only[$rel]))) {
+                        $src = $dest . '/' . $t;
+                        $target = $dest . '/' . $rel;
+                        if (is_file($src) && (is_dir(dirname($target)) || wp_mkdir_p(dirname($target))) && @copy($src, $target)) {
+                            $out['written']++;
+                        } else {
+                            $out['failed'][] = $rel;
+                        }
+                    }
+                    $skip($size + $pad);
+                    continue;
+                }
+                if ($type !== '0' && $type !== "\0" && $type !== '7') {
+                    // Symlinks, devices, FIFOs, GNU dump-dirs/volume labels: never created inside a
+                    // webroot. Reported, not counted as missing.
+                    $out['skipped'][] = $rel;
+                    $skip($size + $pad);
+                    continue;
+                }
+
+                $out['files'][$rel] = (int) $size;
+                if ($mode !== 'extract' || ($only !== null && !isset($only[$rel]))) {
+                    $skip($size + $pad);
+                    continue;
+                }
+                $target = $dest . '/' . $rel;
+                $dir = dirname($target);
+                $fh  = (is_dir($dir) || wp_mkdir_p($dir)) ? @fopen($target, 'wb') : false;
+                $left = $size;
+                while ($left > 0) {
+                    $chunk = $read(min($left, 1048576));
+                    if ($chunk === '') {
+                        if ($fh) {
+                            fclose($fh);
+                        }
+                        throw new RuntimeException('corrupt: archive ends inside ' . $rel);
+                    }
+                    if ($fh) {
+                        fwrite($fh, $chunk);
+                    }
+                    $left -= strlen($chunk);
+                }
+                if ($fh) {
+                    fclose($fh);
+                    self::chmod_safe($target, $fmode);
+                    if ($mtime > 0) {
+                        self::touch_safe($target, $mtime);
+                    }
+                    $out['written']++;
+                } else {
+                    $out['failed'][] = $rel;
+                }
+                $skip($pad);
+            }
+        } finally {
+            if ($gz) {
+                gzclose($h);
+            } else {
+                fclose($h);
+            }
+        }
+        return $out;
+    }
+
+    /** Bytes left under memory_limit, or null when there is no limit. */
+    private function memory_headroom() {
+        $l = trim((string) ini_get('memory_limit'));
+        if ($l === '' || $l === '-1') {
+            return null;
+        }
+        $n = (float) $l;
+        $u = strtoupper(substr($l, -1));
+        if ($u === 'G') { $n *= 1073741824; } elseif ($u === 'M') { $n *= 1048576; } elseif ($u === 'K') { $n *= 1024; }
+        return max(0, (int) $n - memory_get_usage(true));
+    }
+
+    /** Files and hard links from a tar_scan() list that are absent under $dest or have the wrong size. */
+    private function tar_missing($scan, $dest) {
+        $dest = rtrim($dest, '/');
+        $missing = [];
+        foreach ($scan['files'] as $rel => $size) {
+            $p = $dest . '/' . $rel;
+            clearstatcache(true, $p);
+            if (!is_file($p) || filesize($p) !== $size) {
+                $missing[] = $rel;
+            }
+        }
+        foreach ($scan['hardlinks'] as $rel => $t) {
+            $p = $dest . '/' . $rel;
+            clearstatcache(true, $p);
+            $want = isset($scan['files'][$t]) ? $scan['files'][$t] : null;
+            if (!is_file($p) || ($want !== null && filesize($p) !== $want)) {
+                $missing[] = $rel;
+            }
+        }
+        return $missing;
+    }
+
+    /**
+     * Extract a tar / tar.gz with pre-check, PharData + repair, and verification (see block comment
+     * above). Returns a REST response on success, or a WP_Error that names what went wrong.
+     */
+    private function extract_tar_verified($archive, $dest) {
+        $dest = rtrim($dest, '/');
+
+        // 1. PRE-CHECK — headers only, nothing written.
+        try {
+            $scan = $this->tar_scan($archive, 'list');
+        } catch (RuntimeException $e) {
+            $msg = $e->getMessage();
+            if (strpos($msg, 'not_tar') === 0 && strpos($msg, 'truncated') === false) {
+                // Not something this reader understands. Keep the pre-1.9.1 behaviour (PharData
+                // alone) rather than refusing an archive that used to extract; say it is unverified.
+                $r = $this->extract_tar($archive, $dest);
+                if (!is_wp_error($r)) {
+                    $d = $r->get_data();
+                    $d['complete'] = null;
+                    $d['verify_note'] = 'Archive could not be verified: ' . $msg;
+                    $r->set_data($d);
+                }
+                return $r;
+            }
+            if (strpos($msg, 'zlib_unavailable') === 0) {
+                return new WP_Error('zlib_unavailable', 'This server cannot read .gz archives (no zlib); send a plain .tar.', ['status' => 422]);
+            }
+            return new WP_Error('archive_invalid', 'Archive is damaged; nothing was extracted. ' . $msg, ['status' => 422]);
+        }
+        if (!empty($scan['unsafe'])) {
+            return new WP_Error('archive_unsafe',
+                'Archive contains paths outside the destination (absolute or ".."); nothing was extracted.',
+                ['status' => 422, 'unsafe_paths' => array_slice($scan['unsafe'], 0, 100)]);
+        }
+        $files = count($scan['files']) + count($scan['hardlinks']);
+        $need  = 0;
+        foreach ($scan['files'] as $rel => $size) {
+            $p = $dest . '/' . $rel;
+            $have = @is_file($p) ? (int) @filesize($p) : 0;
+            if ($size > $have) {
+                $need += $size - $have;
+            }
+        }
+        $probe = $dest;
+        while (!is_dir($probe) && dirname($probe) !== $probe) {
+            $probe = dirname($probe);
+        }
+        $free = function_exists('disk_free_space') ? @disk_free_space($probe) : false;
+        if ($free !== false && $free !== null && $need > $free) {
+            return new WP_Error('insufficient_space',
+                'Not enough disk space to extract this archive; nothing was extracted.',
+                ['status' => 422, 'needed_bytes' => $need, 'free_bytes' => (int) $free]);
+        }
+        if (!wp_is_writable($probe)) {
+            return new WP_Error('not_writable',
+                'The destination folder is not writable; nothing was extracted.',
+                ['status' => 422, 'dest' => $dest]);
+        }
+
+        // 2. EXTRACT — PharData exactly as before when it can do the job; otherwise the reader.
+        $method = 'phar';
+        $phar_note = null;
+        if ($scan['pax_names'] > 0) {
+            $phar_note = 'skipped: archive uses PAX long names, which PharData mis-extracts';
+        } elseif (!empty($scan['skipped']) || !empty($scan['hardlinks'])) {
+            // PharData would create symlinks (e.g. one pointing at /etc/passwd) inside the webroot,
+            // and writes hard links as empty files.
+            $phar_note = 'skipped: archive contains links or special files';
+        } elseif (($room = $this->memory_headroom()) !== null && $scan['bytes'] * 2 + 16777216 > $room) {
+            // A 40 MB plugin peaked at 65 MB in PharData; past memory_limit that is an uncatchable
+            // fatal half-way through a plugin folder. The reader streams 1 MB at a time.
+            $phar_note = 'skipped: archive too large for PharData within memory_limit';
+        } elseif (!class_exists('PharData')) {
+            $phar_note = 'skipped: PharData unavailable';
+        } else {
+            try {
+                $phar = new PharData($archive);
+                $phar->extractTo($dest, null, true);
+            } catch (Exception $e) {
+                if (stripos($e->getMessage(), 'truncat') !== false) {
+                    return new WP_Error('archive_invalid', 'Archive is truncated. ' . $e->getMessage(), ['status' => 422]);
+                }
+                $phar_note = 'failed: ' . $e->getMessage();
+            }
+        }
+        $repaired = 0;
+        $failed   = [];
+        try {
+            if ($phar_note !== null) {
+                $method = 'stream';
+                $x = $this->tar_scan($archive, 'extract', $dest);
+                $failed = $x['failed'];
+            }
+
+            // 3 + 4. VERIFY, and REPAIR whatever is missing.
+            $missing = $this->tar_missing($scan, $dest);
+            if (!empty($missing)) {
+                $x = $this->tar_scan($archive, 'extract', $dest, array_fill_keys($missing, true));
+                $failed = array_merge($failed, $x['failed']);
+                $repaired = $x['written'];
+                if ($method === 'phar') {
+                    $method = 'phar+repair';
+                }
+                $missing = $this->tar_missing($scan, $dest);
+            }
+        } catch (RuntimeException $e) {
+            return new WP_Error('extract_failed', 'Extraction failed: ' . $e->getMessage(), ['status' => 500]);
+        }
+
+        // 5. Never report success over an incomplete extract.
+        if (!empty($missing)) {
+            return new WP_Error('extract_incomplete',
+                count($missing) . ' of ' . $files . ' files did not extract.',
+                ['status' => 422, 'method' => $method, 'archive_entries' => $files,
+                 'missing' => count($missing), 'missing_paths' => array_slice($missing, 0, 100),
+                 'write_failed' => array_slice($failed, 0, 100), 'phar_note' => $phar_note]);
+        }
+        $data = [
+            'success'         => true,
+            'method'          => $method,
+            'dest'            => $dest,
+            'archive_entries' => $files,
+            'missing'         => 0,
+            'repaired'        => $repaired,
+            'complete'        => true,
+        ];
+        if (!empty($scan['skipped'])) {
+            $data['skipped_links'] = array_slice($scan['skipped'], 0, 100);
+        }
+        if ($phar_note !== null) {
+            $data['phar_note'] = $phar_note;
+        }
+        return rest_ensure_response($data);
+    }
+
     private function extract_tar_gz($archive, $dest) {
         try {
             $phar = new PharData($archive);
@@ -3016,12 +4066,63 @@ class InstaMigrate {
         }
     }
 
+    /** Write every zip entry that is missing under $dest, by its true name. Returns the count written. */
+    private function zip_repair($archive, $dest) {
+        $zip = new ZipArchive();
+        if ($zip->open($archive) !== true) {
+            return 0;
+        }
+        $dest  = rtrim($dest, '/');
+        $fmode = defined('FS_CHMOD_FILE') ? FS_CHMOD_FILE : 0644;
+        $written = 0;
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $name = $zip->getNameIndex($i);
+            if ($name === false || substr($name, -1) === '/') {
+                continue;
+            }
+            $rel = ltrim(str_replace('\\', '/', $name), '/');
+            if ($rel === '' || strpos($rel, "\0") !== false || preg_match('#(^|/)\.\.(/|$)#', $rel)) {
+                continue; // never write outside the destination
+            }
+            $target = $dest . '/' . $rel;
+            if (file_exists($target)) {
+                continue;
+            }
+            $in = $zip->getStream($name);
+            if (!$in || !(is_dir(dirname($target)) || wp_mkdir_p(dirname($target)))) {
+                continue;
+            }
+            $out = @fopen($target, 'wb');
+            if ($out) {
+                stream_copy_to_stream($in, $out);
+                fclose($out);
+                self::chmod_safe($target, $fmode);
+                $st = $zip->statIndex($i);
+                if ($st && !empty($st['mtime'])) {
+                    self::touch_safe($target, $st['mtime']);
+                }
+                $written++;
+            }
+            fclose($in);
+        }
+        $zip->close();
+        return $written;
+    }
+
     private function extract_zip($archive, $dest) {
+        if (!class_exists('ZipArchive')) {
+            return new WP_Error('zip_unavailable', 'This server has no ZipArchive (PHP zip extension); send a .tar.gz instead.', ['status' => 422]);
+        }
         $zip = new ZipArchive();
         if ($zip->open($archive) === true) {
-            $zip->extractTo($dest);
+            // extractTo() returns false when it stops part-way (disk full, permissions, a PHP
+            // limit). Before 1.9.1 that result was ignored and the route answered success.
+            $ok    = $zip->extractTo($dest);
             $count = $zip->numFiles;
             $zip->close();
+            if (!$ok) {
+                return new WP_Error('extract_failed', 'Zip extraction stopped before the end of the archive.', ['status' => 500]);
+            }
             return rest_ensure_response([
                 'success' => true,
                 'method'  => 'ziparchive',
@@ -3114,8 +4215,8 @@ class InstaMigrate {
     public function route_search_replace(WP_REST_Request $request) {
         global $wpdb;
 
-        @set_time_limit(600);
-        @ini_set('memory_limit', '512M');
+        self::set_time_limit_safe(600);
+        self::ini_set_safe('memory_limit', '512M');
 
         $search = $request->get_param('search');
         $replace = $request->get_param('replace');
@@ -3427,8 +4528,8 @@ class InstaMigrate {
     public function route_db_export(WP_REST_Request $request) {
         global $wpdb;
 
-        @set_time_limit(600);
-        @ini_set('memory_limit', '512M');
+        self::set_time_limit_safe(600);
+        self::ini_set_safe('memory_limit', '512M');
 
         $gzip = (bool) $request->get_param('gzip');
         $tables_param = $request->get_param('tables'); // comma-separated or null for all
@@ -3682,8 +4783,8 @@ class InstaMigrate {
     }
 
     public function route_files_archive(WP_REST_Request $request) {
-        @set_time_limit(600);
-        @ini_set('memory_limit', '512M');
+        self::set_time_limit_safe(600);
+        self::ini_set_safe('memory_limit', '512M');
 
         $source_dir = $request->get_param('source_dir');
         $format = $request->get_param('format') ?: 'tar.gz'; // tar.gz or zip
@@ -3764,9 +4865,8 @@ class InstaMigrate {
         if (!empty($exclude)) {
             $response['exclude_applied'] = array_values($exclude);
         }
-        // Any entries whose path exceeded ustar's 255-char limit were NOT written to the tar
-        // (a malformed/GNU entry would be unextractable by PharData on the dest). Report them so
-        // the agent moves them via tar-split-longnames.sh + upload-file-list.sh. Empty = nothing skipped.
+        // Before 1.9.1, paths over ustar's 255-char limit were left out of the tar and listed here.
+        // They are now written as GNU long names, so this is always empty; kept for older callers.
         if (!empty($long_paths)) {
             $response['long_paths'] = array_values($long_paths);
         }
@@ -3781,14 +4881,14 @@ class InstaMigrate {
      *
      * Symlinks are DEREFERENCED (the target's bytes are written) to match the old behavior and to
      * guarantee the content lands on the dest rather than a dangling link; a realpath visited-set
-     * guards against symlink loops. Paths longer than ustar's 255-char name+prefix limit are not
-     * written; their absolute paths are appended to &$long_paths for the per-file fallback.
+     * guards against symlink loops. Paths longer than ustar's 255-char name+prefix limit are
+     * written as GNU long names (1.9.1); &$long_paths is kept for compatibility and stays empty.
      *
      * @return bool true on success; false only if the output gzip sink could not be opened
      *              (caller then falls back to PharData).
      */
     private function stream_tar_gz($source_dir, $basename, $archive_path, &$long_paths, $exclude = []) {
-        @set_time_limit(0);
+        self::set_time_limit_safe(0);
         $source_dir = rtrim($source_dir, '/');
         $gz = gzopen($archive_path, 'wb1'); // level 1: wall-time over ratio (media ~incompressible)
         if ($gz === false) {
@@ -3856,9 +4956,7 @@ class InstaMigrate {
         if ($mode === 0) {
             $mode = 0644;
         }
-        if (!$this->tar_write_header($gz, $entry, $size, $mtime, $mode, '0', $long_paths)) {
-            return; // long path skipped (recorded in $long_paths) — do NOT write its body
-        }
+        $this->tar_write_header($gz, $entry, $size, $mtime, $mode, '0', $long_paths);
         $in = @fopen($path, 'rb');
         if ($in === false) {
             // Header already written; emit a zero-filled body so the archive stays well-formed.
@@ -3887,34 +4985,49 @@ class InstaMigrate {
     }
 
     /**
-     * Build + write a 512-byte POSIX ustar header. Returns false (and records $entry in
-     * &$long_paths) when the path can't fit ustar's name[100]+prefix[155] split (>255 chars or no
-     * split point ≤100 in the tail) — the caller then skips the entry rather than emit a
-     * GNU/pax record PharData may not extract on the dest.
+     * Write the header(s) for one entry. A path that fits ustar's name[100] + prefix[155] split is
+     * written as a plain POSIX ustar header, exactly as before. A longer path (1.9.1) is written
+     * the GNU way: a "././@LongLink" 'L' entry carrying the full name, then the real header with
+     * the name truncated to 100 bytes. PharData reads GNU long names completely on every PHP from
+     * 5.6 to 8.4 (verified 2026-10-29, paths up to 599 bytes), as do GNU tar, bsdtar and Python —
+     * so nothing is skipped any more and &$long_paths stays empty. The parameter and the
+     * `long_paths` response field are kept so existing callers keep working.
+     *
+     * Always returns true.
      */
     private function tar_write_header($gz, $entry, $size, $mtime, $mode, $typeflag, &$long_paths) {
         $name   = $entry;
         $prefix = '';
+        $fits   = true;
         if (strlen($name) > 100) {
-            // Split on a '/' so the tail (name) is ≤100 and the head (prefix) is ≤155.
+            $fits  = false;
+            // Split on a '/' so the tail (name) is <=100 and the head (prefix) is <=155.
             $split = strrpos(substr($name, 0, 101), '/');
             if ($split === false || strlen($name) - $split - 1 > 100 || $split > 155) {
-                // Try the largest prefix ≤155 that leaves a name ≤100.
-                $cut = strrpos(substr($name, 0, 156), '/');
-                if ($cut === false || strlen($name) - $cut - 1 > 100) {
-                    $long_paths[] = $entry;
-                    return false;
-                }
-                $split = $cut;
+                $split = strrpos(substr($name, 0, 156), '/');
             }
-            $prefix = substr($name, 0, $split);
-            $name   = substr($name, $split + 1);
-            if (strlen($name) > 100 || strlen($prefix) > 155) {
-                $long_paths[] = $entry;
-                return false;
+            if ($split !== false && strlen($name) - $split - 1 <= 100 && $split <= 155) {
+                $prefix = substr($name, 0, $split);
+                $name   = substr($name, $split + 1);
+                $fits   = true;
             }
         }
 
+        if ($fits) {
+            gzwrite($gz, $this->tar_header_block($name, $prefix, $size, $mtime, $mode, $typeflag, false));
+            return true;
+        }
+
+        // GNU long name: the full path (NUL-terminated) as the body of an 'L' entry.
+        $long = $entry . "\0";
+        gzwrite($gz, $this->tar_header_block('././@LongLink', '', strlen($long), 0, 0644, 'L', true));
+        gzwrite($gz, $long . str_repeat("\0", (512 - strlen($long) % 512) % 512));
+        gzwrite($gz, $this->tar_header_block(substr($entry, 0, 100), '', $size, $mtime, $mode, $typeflag, true));
+        return true;
+    }
+
+    /** One 512-byte tar header block. $gnu selects GNU magic ("ustar  \0") over POSIX ("ustar\0" "00"). */
+    private function tar_header_block($name, $prefix, $size, $mtime, $mode, $typeflag, $gnu) {
         $header  = pack('a100', $name);                                  // name
         $header .= pack('a8', sprintf('%07o', $mode & 0777) . "\0");     // mode
         $header .= pack('a8', sprintf('%07o', 0) . "\0");                // uid
@@ -3924,7 +5037,7 @@ class InstaMigrate {
         $header .= str_repeat(' ', 8);                                   // chksum placeholder (spaces)
         $header .= pack('a1', $typeflag);                                // typeflag
         $header .= pack('a100', '');                                     // linkname
-        $header .= pack('a6', 'ustar') . pack('a2', '00');               // magic + version
+        $header .= $gnu ? "ustar  \0" : (pack('a6', 'ustar') . pack('a2', '00')); // magic + version
         $header .= pack('a32', '');                                      // uname
         $header .= pack('a32', '');                                      // gname
         $header .= pack('a8', '');                                       // devmajor
@@ -3939,10 +5052,7 @@ class InstaMigrate {
             $sum += ord($header[$i]);
         }
         $chk = sprintf('%06o', $sum) . "\0 ";
-        $header = substr($header, 0, 148) . $chk . substr($header, 156);
-
-        gzwrite($gz, $header);
-        return true;
+        return substr($header, 0, 148) . $chk . substr($header, 156);
     }
 
     private function zip_add_dir($zip, $dir, $prefix, $exclude = []) {
@@ -3978,7 +5088,7 @@ class InstaMigrate {
      * client passes one straight back as `?path=` to drill in, and they match the exclude contract.
      */
     public function route_files_list(WP_REST_Request $request) {
-        @set_time_limit(60);
+        self::set_time_limit_safe(60);
 
         $rel_param   = (string) $request->get_param('path'); // wp-content-relative; '' = content root
         $content_real = realpath(WP_CONTENT_DIR);
