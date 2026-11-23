@@ -3,7 +3,7 @@
  * Plugin Name: InstaMigrate
  * Plugin URI: https://wordpress.org/plugins/instamigrate/
  * Description: Migration helper for WordPress site transfers. Provides secure REST API endpoints for database import, file transfer, and search-replace. REMOVE THIS PLUGIN AFTER MIGRATION.
- * Version: 1.9.1
+ * Version: 1.9.2
  * Author: InstaWP
  * Author URI: https://instawp.com/
  * License: MIT
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('INSTA_MIGRATE_VERSION', '1.9.1');
+define('INSTA_MIGRATE_VERSION', '1.9.2');
 define('INSTA_MIGRATE_OPTION_KEY', 'insta_migrate_api_key');
 define('INSTA_MIGRATE_TEMP_DIR', wp_upload_dir()['basedir'] . '/instamigrate');
 
@@ -160,6 +160,13 @@ class InstaMigrate {
         // authenticated /status to a keyless request (QA, 2026-10-29), and /status can now carry fatal
         // details. Applies to insta-migrate/v1 routes only.
         add_filter('rest_post_dispatch', [$this, 'rest_no_store'], 10, 3);
+        // Page caches that ignore Cache-Control (nginx microcache) honour X-Accel-Expires. Sent
+        // before any route runs, so streamed responses such as /files/download carry it too.
+        add_action('rest_api_init', [$this, 'send_no_cache_headers'], 0);
+        // rest_api_init fires once per request, and can fire before the route is known (a plugin
+        // calling register_rest_route() on init). parse_request runs after the route is parsed and
+        // before core's rest_api_loaded (priority 10), so it covers that case.
+        add_action('parse_request', [$this, 'send_no_cache_headers'], 0);
         // Admin menu: network admin when network-activated on multisite, otherwise regular admin
         if ($this->is_network_active()) {
             add_action('network_admin_menu', [$this, 'add_admin_page']);
@@ -1909,6 +1916,25 @@ class InstaMigrate {
     // block, a host that blocks loopback requests — is "unknown", never "ok". A failing check
     // undoes the change; "unknown" keeps it unless revert_on_unknown=true. A site already failing
     // before the change is refused with 409, and one call runs at a time (409 while locked).
+
+    /**
+     * Tell every cache in front of PHP not to store this plugin's answers (1.9.2).
+     *
+     * An nginx microcache was measured replaying a key-authenticated response, including a
+     * /files/download body, to a request with no key for several seconds, even with
+     * `Cache-Control: no-store` set: it ignores Cache-Control but honours X-Accel-Expires.
+     * rest_no_store() only runs for routes that return, and /files/download streams and exits,
+     * so this runs at parse_request and rest_api_init, before any route callback (sending the
+     * same headers twice is harmless). The namespace is matched
+     * case-insensitively, as core's router matches it.
+     */
+    public function send_no_cache_headers() {
+        if (headers_sent() || !preg_match('@^/insta-migrate/@i', $this->current_rest_route())) {
+            return;
+        }
+        header('X-Accel-Expires: 0');
+        header('Cache-Control: private, no-store, max-age=0');
+    }
 
     /** Register the per-request recorder for a health-check request carrying our token. */
     public function rest_no_store($response, $server, $request) {
@@ -4483,8 +4509,38 @@ class InstaMigrate {
      * Search-replace that correctly handles serialized PHP data.
      */
     private function do_search_replace($search, $replace, $data) {
-        // Try to unserialize
-        $unserialized = @unserialize($data);
+        // A value holding an object of any class other than stdClass (O:, C: or an E: enum) is
+        // never unserialized: building it would run that class's code (__wakeup, __destruct,
+        // autoloaders) on values that visitors can write, such as comment text. Its strings are
+        // rewritten in the serialized text instead, with their lengths recomputed. A C: object's
+        // payload (its format belongs to the class) is copied unopened. Anything the walk does not
+        // understand (a malformed value, say) is left exactly as it is, for the post-run residue
+        // audit to report.
+        // Text that only mentions such a token (it is not a serialized value) falls through to the
+        // plain-string replace below. is_serialized() does not recognise a top-level C: value, so
+        // that shape is matched here too (and comes back unchanged from the walk).
+        if ((is_serialized($data) || preg_match('/^C:\+?\d+:"/', $data))
+            && preg_match('/(?:O:\+?\d+:"(?!stdClass":)|C:\+?\d+:"|E:\d+:")/i', $data)) {
+            try {
+                $rewritten = $this->sr_serialized_text($search, $replace, $data);
+            } catch (\Exception $e) {
+                $rewritten = null;
+            } catch (\Throwable $e) {
+                $rewritten = null;
+            }
+            return $rewritten === null ? $data : $rewritten;
+        }
+        // Only stdClass may be instantiated here: any other class would come back as
+        // __PHP_Incomplete_Class.
+        // is_serialized() first: it rejects most text that only starts like a serialized value (a
+        // comment, say), which PHP's parser would otherwise accept and re-serialise without its
+        // trailing text. It checks the first and last characters only, so it is not complete.
+        $unserialized = false;
+        if (is_serialized($data)) {
+            $unserialized = PHP_VERSION_ID >= 70000
+                ? @unserialize($data, ['allowed_classes' => ['stdClass']])
+                : @unserialize($data);
+        }
         if ($unserialized !== false || $data === 'b:0;') {
             // It's serialized data — recurse into it
             $replaced = $this->search_replace_recursive($search, $replace, $unserialized);
@@ -4502,6 +4558,160 @@ class InstaMigrate {
         return $this->sr_replace($search, $replace, $data);
     }
 
+    /**
+     * Search-replace inside a serialized value without unserializing it (1.9.2).
+     *
+     * Walks the serialized grammar token by token, runs sr_replace() on every string value and array
+     * key (object property names are left as they are, as search_replace_recursive() leaves them)
+     * and writes each string back
+     * with its byte length recomputed. Every other token is copied byte for byte. No object is
+     * built, so no class code runs. A C: object's payload is copied unopened. Returns null, so the
+     * caller keeps the value unchanged, when the value is not one complete, well-formed serialized
+     * value this walk understands: truncated or malformed input, trailing text, or nesting deeper
+     * than 512.
+     *
+     * @return string|null
+     */
+    private function sr_serialized_text($search, $replace, $data) {
+        $pos = 0;
+        $out = $this->sr_serialized_token($search, $replace, $data, $pos, 0);
+        if ($out === null || $pos !== strlen($data)) {
+            return null;
+        }
+        // The result must still be a valid serialized value. On PHP 7+ check it without building any
+        // object; PHP 5.6 cannot do that safely, and the walk only emits tokens it parsed.
+        if (PHP_VERSION_ID >= 70000 && $out !== 'b:0;'
+            && false === @unserialize($out, ['allowed_classes' => false])) {
+            return null;
+        }
+        return $out;
+    }
+
+    /** One token of sr_serialized_text(); advances $p past it. Null when it cannot be parsed. */
+    private function sr_serialized_token($search, $replace, $s, &$p, $depth, $rewrite = true) {
+        if ($depth > 512 || !isset($s[$p + 1]) || ($s[$p + 1] !== ':' && $s[$p] !== 'N')) {
+            return null;
+        }
+        switch ($s[$p]) {
+            case 'N':
+                if (substr($s, $p, 2) !== 'N;') {
+                    return null;
+                }
+                $p += 2;
+                return 'N;';
+            case 'b':
+            case 'i':
+            case 'd':
+            case 'r':
+            case 'R':
+                if (!preg_match('/\G[bidrR]:[-+0-9.eEINFAinfa]+;/', $s, $m, 0, $p)) {
+                    return null;
+                }
+                $p += strlen($m[0]);
+                return $m[0];
+            case 's':
+                if (!preg_match('/\Gs:(\d+):"/', $s, $m, 0, $p)) {
+                    return null;
+                }
+                $start = $p + strlen($m[0]);
+                $len   = (int) $m[1];
+                // Bound the declared length first: one larger than PHP_INT_MAX saturates, and the
+                // offset sum would become a float, which substr() rejects with a TypeError on PHP 8.
+                if ($len > strlen($s) - $start || substr($s, $start + $len, 2) !== '";') {
+                    return null;
+                }
+                $p   = $start + $len + 2;
+                $new = substr($s, $start, $len);
+                if ($rewrite) {
+                    $new = (string) $this->sr_replace($search, $replace, $new);
+                }
+                return 's:' . strlen($new) . ':"' . $new . '";';
+            case 'E':
+                // An enum case: "Class:Case", copied as it is.
+                if (!preg_match('/\GE:(\d+):"/', $s, $m, 0, $p)
+                    || (int) $m[1] > strlen($s) - $p - strlen($m[0])) {
+                    return null;
+                }
+                $end = $p + strlen($m[0]) + (int) $m[1];
+                if (substr($s, $end, 2) !== '";') {
+                    return null;
+                }
+                // Validating the result would autoload an enum class that is not loaded yet; leave
+                // such a value unchanged instead.
+                $case = substr($s, $p + strlen($m[0]), (int) $m[1]);
+                $colon = strrpos($case, ':');
+                if ($colon === false || !class_exists(substr($case, 0, $colon), false)) {
+                    return null;
+                }
+                $tok = substr($s, $p, $end + 2 - $p);
+                $p   = $end + 2;
+                return $tok;
+            case 'a':
+                if (!preg_match('/\Ga:(\d+):\{/', $s, $m, 0, $p)) {
+                    return null;
+                }
+                $p   += strlen($m[0]);
+                $body = $this->sr_serialized_members($search, $replace, $s, $p, (int) $m[1], $depth, false);
+                return $body === null ? null : 'a:' . $m[1] . ':{' . $body . '}';
+            case 'O':
+                if (!preg_match('/\GO:(\d+):"/', $s, $m, 0, $p)) {
+                    return null;
+                }
+                $class_at = $p + strlen($m[0]);
+                $class    = substr($s, $class_at, (int) $m[1]);
+                if (strlen($class) !== (int) $m[1]
+                    || !preg_match('/\G":(\d+):\{/', $s, $m2, 0, $class_at + (int) $m[1])) {
+                    return null;
+                }
+                $p    = $class_at + (int) $m[1] + strlen($m2[0]);
+                $body = $this->sr_serialized_members($search, $replace, $s, $p, (int) $m2[1], $depth, true);
+                return $body === null ? null : 'O:' . $m[1] . ':"' . $class . '":' . $m2[1] . ':{' . $body . '}';
+            case 'C':
+                // A Serializable object. Its payload format belongs to the class, so it is copied
+                // byte for byte, unopened: the strings around it are still rewritten, and a search
+                // term inside the payload is left for the residue audit.
+                if (!preg_match('/\GC:(\d+):"/', $s, $m, 0, $p)) {
+                    return null;
+                }
+                $class_at = $p + strlen($m[0]);
+                if ((int) $m[1] > strlen($s) - $class_at
+                    || !preg_match('/\G":(\d+):\{/', $s, $m2, 0, $class_at + (int) $m[1])) {
+                    return null;
+                }
+                $body_at = $class_at + (int) $m[1] + strlen($m2[0]);
+                if ((int) $m2[1] > strlen($s) - $body_at - 1 || $s[$body_at + (int) $m2[1]] !== '}') {
+                    return null;
+                }
+                $tok = substr($s, $p, $body_at + (int) $m2[1] + 1 - $p);
+                $p   = $body_at + (int) $m2[1] + 1;
+                return $tok;
+            default:
+                // S: (escaped strings) and anything unknown.
+                return null;
+        }
+    }
+
+    /**
+     * $count key/value pairs and the closing brace of an array or object body. An object's property
+     * names are structure, not content (a private one even embeds its class name), so they are copied
+     * as they are; array keys are rewritten, as search_replace_recursive() rewrites them.
+     */
+    private function sr_serialized_members($search, $replace, $s, &$p, $count, $depth, $is_object) {
+        $out = '';
+        for ($i = 0; $i < 2 * $count; $i++) {
+            $tok = $this->sr_serialized_token($search, $replace, $s, $p, $depth + 1, !($is_object && $i % 2 === 0));
+            if ($tok === null) {
+                return null;
+            }
+            $out .= $tok;
+        }
+        if (!isset($s[$p]) || $s[$p] !== '}') {
+            return null;
+        }
+        $p++;
+        return $out;
+    }
+
     private function search_replace_recursive($search, $replace, $data) {
         if (is_string($data)) {
             return $this->sr_replace($search, $replace, $data);
@@ -4513,6 +4723,11 @@ class InstaMigrate {
                 $result[$new_key] = $this->search_replace_recursive($search, $replace, $value);
             }
             return $result;
+        }
+        if ($data instanceof __PHP_Incomplete_Class) {
+            // A class unserialize() was not allowed to build. Its properties cannot be written,
+            // so it is returned untouched and re-serialises to an equivalent value.
+            return $data;
         }
         if (is_object($data)) {
             foreach ($data as $key => $value) {
@@ -6001,8 +6216,47 @@ class InstaMigrate {
                 require_once ABSPATH . 'wp-admin/includes/file.php';
             }
 
+            // Only plugins WordPress lists as installed, checked before anything is deactivated.
+            // delete_plugins() recursively deletes dirname() of each path it is given, so a path
+            // containing ../ would take a directory outside wp-content/plugins with it (1.9.2).
+            // A plugin that is no longer on disk (a retry, or one this site never had) counts as
+            // already deleted, as it did before: there is nothing for delete_plugins() to remove.
+            // It is still deactivated, as before, so a stale active_plugins entry is cleared
+            // (deactivate_plugins() only edits the option; it never loads the plugin's file).
+            $installed = get_plugins();
+            $refused   = [];
+            $absent    = [];
+            foreach ( $plugin_files as $plugin_file ) {
+                if ( 0 !== validate_file( $plugin_file ) ) {
+                    $refused[] = $plugin_file;
+                } elseif ( ! isset( $installed[ $plugin_file ] ) ) {
+                    $dir = dirname( $plugin_file );
+                    if ( file_exists( WP_PLUGIN_DIR . '/' . ( '.' === $dir ? $plugin_file : $dir ) ) ) {
+                        $refused[] = $plugin_file;
+                    } else {
+                        $absent[] = $plugin_file;
+                    }
+                }
+            }
+            if ( $refused ) {
+                return new WP_Error(
+                    'invalid_plugin_files',
+                    'Not an installed plugin: ' . implode( ', ', $refused ) . '. Nothing was deleted.',
+                    [ 'status' => 400, 'refused' => $refused ]
+                );
+            }
+
             // delete_plugins() requires plugins to be inactive — deactivate first.
             $this->deactivate_plugin_files( $plugin_files );
+
+            $plugin_files = array_values( array_diff( $plugin_files, $absent ) );
+            if ( empty( $plugin_files ) ) {
+                return rest_ensure_response( [
+                    'success'        => true,
+                    'message'        => esc_html( 'Success!' ),
+                    'already_absent' => $absent,
+                ] );
+            }
 
             $result = delete_plugins( $plugin_files );
             // Per WP docs:
@@ -6020,10 +6274,14 @@ class InstaMigrate {
                 return new WP_Error( 'empty_plugins', 'delete_plugins() received an empty plugins list.', [ 'status' => 500 ] );
             }
 
-            return rest_ensure_response( [
+            $response = [
                 'success' => true,
                 'message' => esc_html( 'Success!' ),
-            ] );
+            ];
+            if ( $absent ) {
+                $response['already_absent'] = $absent;
+            }
+            return rest_ensure_response( $response );
         } catch (\Exception $e) {
             return new WP_Error( 'exception', $e->getMessage(), [ 'status' => 500 ] );
         } catch (\Throwable $e) {

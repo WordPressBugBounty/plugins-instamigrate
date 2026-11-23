@@ -4,7 +4,7 @@ Tags: migration, transfer, backup, clone, database
 Requires at least: 5.0
 Tested up to: 7.0
 Requires PHP: 5.6
-Stable tag: 1.9.1
+Stable tag: 1.9.2
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -53,6 +53,11 @@ Yes. The search-replace engine correctly unserializes PHP data, performs replace
 Two methods: (1) `X-Insta-Key` header with the plugin API key, or (2) WordPress Application Passwords via HTTP Basic Auth (requires admin privileges).
 
 == Changelog ==
+
+= 1.9.2 =
+* Improvement: responses from the plugin's endpoints, including file downloads, are now marked so that server-side page caches do not store them.
+* Improvement: database search-replace no longer rebuilds objects of other classes when it reads serialized values. Their text is updated in place, with lengths recalculated. A value it cannot read is left unchanged.
+* Improvement: the delete-plugin endpoint now accepts only plugins that are installed on the site, and checks the whole list before changing anything. Plugins already missing from disk are deactivated and reported back as already absent.
 
 = 1.9.1 =
 * Fix: extracting a .tar or .tar.gz no longer loses files whose path is longer than 100 characters. Archives written in the common PAX format (Python, bsdtar, macOS tar) used to drop those files silently, and a plugin missing one of its files could take the whole site down. Every tar archive is now checked before anything is written, extracted, and verified file by file.
