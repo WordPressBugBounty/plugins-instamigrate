@@ -4,7 +4,7 @@ Tags: migration, transfer, backup, clone, database
 Requires at least: 5.0
 Tested up to: 7.0
 Requires PHP: 5.6
-Stable tag: 1.9.2
+Stable tag: 1.9.3
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -53,6 +53,10 @@ Yes. The search-replace engine correctly unserializes PHP data, performs replace
 Two methods: (1) `X-Insta-Key` header with the plugin API key, or (2) WordPress Application Passwords via HTTP Basic Auth (requires admin privileges).
 
 == Changelog ==
+
+= 1.9.3 =
+* Fix: the fix-prefix endpoint now renames only the settings WordPress ties to the table prefix (the user roles list and per-user settings). Other settings whose names happen to start with the old prefix are left as they are. Running it again, or with a new prefix that starts with the old one, no longer renames anything twice, and when a key already exists under the new prefix, the source site's value is used and the existing one is kept under a backup name instead of stopping the whole run. Multisite subsites' user roles are now renamed too. A database read that fails during the rename is now reported as an error, and on multisite a new prefix that is the old prefix plus a number is refused, because subsite settings could not be told apart.
+* Improvement: database export is much faster on large tables and reads every table from one consistent snapshot, so rows written while the export runs can no longer be duplicated or missed. Rows are fetched in batches sized to the table's row size, which lowers memory use. The export file format is unchanged.
 
 = 1.9.2 =
 * Improvement: responses from the plugin's endpoints, including file downloads, are now marked so that server-side page caches do not store them.

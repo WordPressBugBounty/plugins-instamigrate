@@ -3,7 +3,7 @@
  * Plugin Name: InstaMigrate
  * Plugin URI: https://wordpress.org/plugins/instamigrate/
  * Description: Migration helper for WordPress site transfers. Provides secure REST API endpoints for database import, file transfer, and search-replace. REMOVE THIS PLUGIN AFTER MIGRATION.
- * Version: 1.9.2
+ * Version: 1.9.3
  * Author: InstaWP
  * Author URI: https://instawp.com/
  * License: MIT
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('INSTA_MIGRATE_VERSION', '1.9.2');
+define('INSTA_MIGRATE_VERSION', '1.9.3');
 define('INSTA_MIGRATE_OPTION_KEY', 'insta_migrate_api_key');
 define('INSTA_MIGRATE_TEMP_DIR', wp_upload_dir()['basedir'] . '/instamigrate');
 
@@ -3297,66 +3297,275 @@ class InstaMigrate {
 
         $results = [];
         $old_len = strlen($old_prefix);
-
-        // Escape underscores for LIKE patterns (underscore is a SQL wildcard)
         $old_prefix_like = $wpdb->esc_like($old_prefix);
+        $new_prefix_like = $wpdb->esc_like($new_prefix);
 
-        // Use CONCAT + SUBSTRING instead of REPLACE for idempotency:
-        // REPLACE('wp_new_caps', 'wp_', 'wp_new_') would double-replace if new contains old.
-        // CONCAT('wp_new_', SUBSTRING(col, len('wp_')+1)) replaces only the leading prefix, once.
-
-        // 1. Fix usermeta meta_key values: {old_prefix}capabilities → {new_prefix}capabilities, etc.
-        $usermeta_count = $wpdb->query($wpdb->prepare(
-            "UPDATE `{$usermeta_table}` SET `meta_key` = CONCAT(%s, SUBSTRING(`meta_key`, %d)) WHERE `meta_key` LIKE %s",
-            $new_prefix,
-            $old_len + 1,
-            $old_prefix_like . '%'
-        ));
-        $results['usermeta_updated'] = $usermeta_count !== false ? $usermeta_count : 0;
-        $results['usermeta_error'] = $wpdb->last_error ?: null;
-
-        // 2. Fix options option_name values: {old_prefix}user_roles → {new_prefix}user_roles, etc.
-        $options_count = $wpdb->query($wpdb->prepare(
-            "UPDATE `{$options_table}` SET `option_name` = CONCAT(%s, SUBSTRING(`option_name`, %d)) WHERE `option_name` LIKE %s",
-            $new_prefix,
-            $old_len + 1,
-            $old_prefix_like . '%'
-        ));
-        $results['options_updated'] = $options_count !== false ? $options_count : 0;
-        $results['options_error'] = $wpdb->last_error ?: null;
-
-        // 3. For multisite, also fix sitemeta if it exists
-        $sitemeta_table = $new_prefix . 'sitemeta';
-        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name from validated prefix
-        $sitemeta_exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $wpdb->esc_like($sitemeta_table)));
-        if ($sitemeta_exists) {
-            $sitemeta_count = $wpdb->query($wpdb->prepare(
-                "UPDATE `{$sitemeta_table}` SET `meta_key` = CONCAT(%s, SUBSTRING(`meta_key`, %d)) WHERE `meta_key` LIKE %s",
-                $new_prefix,
-                $old_len + 1,
-                $old_prefix_like . '%'
-            ));
-            $results['sitemeta_updated'] = $sitemeta_count !== false ? $sitemeta_count : 0;
-            $results['sitemeta_error'] = $wpdb->last_error ?: null;
+        // Only names WordPress itself builds from the table prefix are renamed (1.9.3).
+        //  - options: `{prefix}user_roles` is the ONLY option name core builds from the prefix
+        //    (WP_Roles, wp-includes/class-wp-roles.php). Every other option that merely starts with
+        //    the old prefix — wp_page_for_privacy_policy, wp_mail_smtp, wp_rocket_settings — is a fixed
+        //    name, and renaming it hid that setting from WordPress and its plugin. On multisite each
+        //    subsite keeps its own `{prefix}{id}_user_roles` in its own options table.
+        //  - usermeta: keys on the old prefix are user options (`{prefix}capabilities`, user_level,
+        //    user-settings, update_user_option() keys …), so they are all renamed — except a key
+        //    already on the new prefix (when the new prefix starts with the old one, `LIKE old%` also
+        //    matches correct keys, and renaming them again doubled the prefix). When the same user holds a
+        //    key under both prefixes, the old-prefix (source) value wins and the other is backed up.
+        //  - sitemeta: core builds no network option name from the prefix, so nothing is renamed.
+        // A collision never aborts the rest: the source's value wins and the leftover is backed up.
+        $new_starts_with_old = (strpos($new_prefix, $old_prefix) === 0);
+        $old_starts_with_new = (strpos($old_prefix, $new_prefix) === 0);
+        $new_len = strlen($new_prefix);
+        // On multisite a subsite's user keys are `{old}{id}_capabilities`. If the new prefix is the old
+        // one plus digits (wp_ -> wp_2_, or wp_ -> wp_2), those keys already look like keys of the new
+        // prefix, and no rule can tell them apart: leaving them would move subsite roles to the main
+        // site or to another subsite. Refuse (also when the multisite check itself cannot be read).
+        if ($new_starts_with_old && preg_match('/^[0-9]+(?:_|$)/', substr($new_prefix, $old_len))) {
+            $is_network = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($new_prefix . 'sitemeta')));
+            if ($is_network || $wpdb->last_error) {
+                return new WP_Error('ambiguous_prefix', 'On multisite, a new prefix made of the old prefix plus a number cannot be told apart from subsite keys. Nothing was changed.', ['status' => 409]);
+            }
         }
+        // When a key exists under BOTH prefixes, the old-prefix row is the source site's live value
+        // (the source's WordPress read it) and the new-prefix row is a leftover. The source's value
+        // wins; the leftover is kept under this suffix rather than deleted (owner decision, 1.9.3).
+        $backup_suffix = '_im_backup_' . gmdate('YmdHis');
 
-        // 4. Verify the fix worked — check for any remaining old-prefix keys
-        $remaining_usermeta = $wpdb->get_var($wpdb->prepare(
+        // Every key comparison is byte-exact. meta_key and option_name use case-insensitive
+        // collations, so a plain LIKE/= would treat `CAxx_` and `caxx_` as the same prefix: each row
+        // would "clash" with itself and be backed up, leaving no live roles. LIKE stays only to let
+        // MySQL narrow by index; the BINARY test decides.
+        // Each test is wrapped in its own parentheses so a NOT in front of it stays a NOT of the
+        // whole comparison under the HIGH_NOT_PRECEDENCE sql_mode, and CAST(… AS BINARY) is used
+        // instead of the BINARY operator MySQL 8 deprecates.
+        $starts_with = function ($col, $str) use ($wpdb) {
+            return $wpdb->prepare("(LEFT({$col}, %d) = CAST(%s AS BINARY))", strlen($str), $str);
+        };
+        $starts_old = function ($col) use ($starts_with, $old_prefix) {
+            return $starts_with($col, $old_prefix);
+        };
+        $starts_new = function ($col) use ($starts_with, $new_prefix) {
+            return $starts_with($col, $new_prefix);
+        };
+        // When the old prefix extends the new one (old = new . X), a key starting with old . X would
+        // still carry the old prefix after the move; it is left in place and reported, so a retry can
+        // never shuffle values between keys.
+        $old_extra = $old_starts_with_new ? $old_prefix . substr($old_prefix, $new_len) : '';
+        // A key "to move" starts with the old prefix and — when the new prefix extends the old one —
+        // is not already on the new prefix (renaming those again doubled the prefix).
+        $to_move = function ($col) use ($starts_old, $starts_new, $starts_with, $new_starts_with_old, $old_extra) {
+            return '(' . $starts_old($col)
+                . ($new_starts_with_old ? ' AND NOT ' . $starts_new($col) : '')
+                . ($old_extra !== '' ? ' AND NOT ' . $starts_with($col, $old_extra) : '') . ')';
+        };
+        // A key "already new" starts with the new prefix and — when the old prefix extends the new
+        // one — is not itself an old-prefix key.
+        $is_new = function ($col) use ($starts_old, $starts_new, $old_starts_with_new) {
+            return '(' . $starts_new($col) . ($old_starts_with_new ? ' AND NOT ' . $starts_old($col) : '') . ')';
+        };
+
+        // 1. usermeta — set-based (1.9.3): one UPDATE per umeta_id range, joined against the same
+        //    table. No rows are read into PHP, so it scales to large sites and low memory limits.
+        $bounds = $wpdb->get_row($wpdb->prepare(
+            "SELECT MIN(`umeta_id`) AS lo, MAX(`umeta_id`) AS hi FROM `{$usermeta_table}` WHERE `meta_key` LIKE %s",
+            $old_prefix_like . '%'
+        ), ARRAY_A);
+        $usermeta_errors = [];
+        if ($wpdb->last_error) {
+            $usermeta_errors[] = $wpdb->last_error;
+        }
+        // The joined copy must be read through an index that starts with user_id. Right after an
+        // import the table has no statistics yet, and MySQL then scans the whole table once per
+        // row (quadratic: minutes on 300k rows). Core's usermeta always has the `user_id` index.
+        $b_hint = '';
+        foreach ((array) $wpdb->get_results("SHOW INDEX FROM `{$usermeta_table}`", ARRAY_A) as $ix) {
+            if ((int) $ix['Seq_in_index'] === 1 && $ix['Column_name'] === 'user_id' && preg_match('/^[A-Za-z0-9_]+$/', $ix['Key_name'])) {
+                $b_hint = ' FORCE INDEX (`' . $ix['Key_name'] . '`)';
+                break;
+            }
+        }
+        $usermeta_updated  = 0;
+        $usermeta_replaced = 0;
+        if ($bounds && $bounds['lo'] !== null) {
+            // 1a. Back up new-prefix rows whose user also holds the same key on the old prefix.
+            $nb = $wpdb->get_row($wpdb->prepare(
+                "SELECT MIN(`umeta_id`) AS lo, MAX(`umeta_id`) AS hi FROM `{$usermeta_table}` WHERE `meta_key` LIKE %s",
+                $new_prefix_like . '%'
+            ), ARRAY_A);
+            if ($wpdb->last_error) {
+                $usermeta_errors[] = $wpdb->last_error;
+            }
+            if ($nb && $nb['lo'] !== null) {
+                for ($lo = (int) $nb['lo']; $lo <= (int) $nb['hi']; $lo += 100000) {
+                    $n = $wpdb->query($wpdb->prepare(
+                        "UPDATE `{$usermeta_table}` b FORCE INDEX (PRIMARY) JOIN `{$usermeta_table}` a{$b_hint}
+                            ON a.`user_id` = b.`user_id` AND a.`umeta_id` <> b.`umeta_id`
+                           AND a.`meta_key` = CAST(CONCAT(%s, SUBSTRING(b.`meta_key`, %d)) AS BINARY)
+                         SET b.`meta_key` = CONCAT(b.`meta_key`, %s)
+                         WHERE b.`umeta_id` BETWEEN %d AND %d AND b.`meta_key` LIKE %s",
+                        $old_prefix, $new_len + 1, $backup_suffix, $lo, $lo + 99999, $new_prefix_like . '%'
+                    ) . ' AND ' . $is_new('b.`meta_key`') . ' AND ' . $to_move('a.`meta_key`'));
+                    if ($n === false) {
+                        $usermeta_errors[] = $wpdb->last_error;
+                        continue;
+                    }
+                    $usermeta_replaced += (int) $n;
+                }
+            }
+
+            // 1b. Move old-prefix keys to the new prefix, except where the user still holds the new
+            //     key (only possible when 1a could not run).
+            for ($lo = (int) $bounds['lo']; $lo <= (int) $bounds['hi']; $lo += 100000) {
+                $n = $wpdb->query($wpdb->prepare(
+                    // FORCE INDEX (PRIMARY): read `a` by umeta_id range, never through the meta_key
+                    // index this statement rewrites (that plan took minutes on 300k rows).
+                    "UPDATE `{$usermeta_table}` a FORCE INDEX (PRIMARY) LEFT JOIN `{$usermeta_table}` b{$b_hint}
+                        ON b.`user_id` = a.`user_id` AND b.`umeta_id` <> a.`umeta_id`
+                       AND b.`meta_key` = CAST(CONCAT(%s, SUBSTRING(a.`meta_key`, %d)) AS BINARY)
+                     SET a.`meta_key` = CONCAT(%s, SUBSTRING(a.`meta_key`, %d))
+                     WHERE a.`umeta_id` BETWEEN %d AND %d AND a.`meta_key` LIKE %s",
+                    $new_prefix, $old_len + 1, $new_prefix, $old_len + 1, $lo, $lo + 99999, $old_prefix_like . '%'
+                ) . ' AND ' . $to_move('a.`meta_key`') . ' AND b.`umeta_id` IS NULL');
+                if ($n === false) {
+                    $usermeta_errors[] = $wpdb->last_error;
+                    continue;
+                }
+                $usermeta_updated += (int) $n;
+            }
+        }
+        // Rows still to move whose user already holds the new key: left in place, not overwritten.
+        $usermeta_skipped = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `{$usermeta_table}` a JOIN `{$usermeta_table}` b{$b_hint}
+                ON b.`user_id` = a.`user_id` AND b.`umeta_id` <> a.`umeta_id`
+               AND b.`meta_key` = CAST(CONCAT(%s, SUBSTRING(a.`meta_key`, %d)) AS BINARY)
+             WHERE a.`meta_key` LIKE %s",
+            $new_prefix, $old_len + 1, $old_prefix_like . '%'
+        ) . ' AND ' . $to_move('a.`meta_key`'));
+        if ($wpdb->last_error) {
+            $usermeta_errors[] = $wpdb->last_error;
+        }
+        $results['usermeta_updated'] = $usermeta_updated;
+        $results['usermeta_replaced_existing'] = $usermeta_replaced;
+        $results['usermeta_skipped_existing'] = $usermeta_skipped;
+
+        // 2. options: `{old}user_roles` in the main options table, plus each subsite's
+        //    `{old}{id}_user_roles` in `{new}{id}_options` on multisite. Names compared byte-exact.
+        $options_errors  = [];
+        $role_tables = ['' => $options_table];
+        $option_tables = (array) $wpdb->get_col($wpdb->prepare('SHOW TABLES LIKE %s', $new_prefix_like . '%\_options'));
+        if ($wpdb->last_error) {
+            $options_errors[] = $wpdb->last_error;
+        }
+        foreach ($option_tables as $t) {
+            $mid = substr($t, strlen($new_prefix), -strlen('_options'));
+            if (preg_match('/^[0-9]+$/', $mid)) {
+                $role_tables[$mid . '_'] = $t;
+            }
+        }
+        // The plain `=` lets MySQL use the option_name index; the CAST makes the match byte-exact.
+        $has_option = function ($table, $name) use ($wpdb, &$options_errors) {
+            $n = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$table}` WHERE `option_name` = %s AND `option_name` = CAST(%s AS BINARY)", $name, $name));
+            if ($wpdb->last_error) {
+                $options_errors[] = $wpdb->last_error;
+            }
+            return (bool) $n;
+        };
+        $rename_option = function ($table, $from, $to) use ($wpdb) {
+            return $wpdb->query($wpdb->prepare("UPDATE `{$table}` SET `option_name` = %s WHERE `option_name` = %s AND `option_name` = CAST(%s AS BINARY)", $to, $from, $from));
+        };
+        $options_updated = 0;
+        $options_skipped = 0;
+        $options_backed_up = [];
+        $remaining_roles = 0;
+        foreach ($role_tables as $blog_part => $table) {
+            $from = $old_prefix . $blog_part . 'user_roles';
+            $to   = $new_prefix . $blog_part . 'user_roles';
+            $read_errors = count($options_errors);
+            if (!$has_option($table, $from)) {
+                if (count($options_errors) > $read_errors) {
+                    $remaining_roles++;
+                }
+                continue;
+            }
+            $backup = null;
+            if ($has_option($table, $to)) {
+                // Both exist: the source's row wins; the leftover is kept under a backup name.
+                $backup = $to . $backup_suffix;
+                if ($has_option($table, $backup)) {
+                    $options_skipped++;
+                    $remaining_roles++;
+                    continue;
+                }
+                if ($rename_option($table, $to, $backup) === false) {
+                    $options_errors[] = $wpdb->last_error;
+                    $remaining_roles++;
+                    continue;
+                }
+            }
+            $ok = $rename_option($table, $from, $to);
+            if ($ok === false) {
+                $options_errors[] = $wpdb->last_error;
+                $remaining_roles++;
+                if ($backup !== null) {
+                    // Put the leftover back so the site is never left without `{new}user_roles`.
+                    if ($rename_option($table, $backup, $to) === false) {
+                        $options_errors[] = "restore failed, roles left at {$backup}: " . $wpdb->last_error;
+                        $options_backed_up[] = $backup;
+                    }
+                }
+                continue;
+            }
+            if ($backup !== null) {
+                $options_backed_up[] = $backup;
+            }
+            $options_updated += (int) $ok;
+        }
+        $results['options_updated'] = $options_updated;
+        $results['options_skipped_existing'] = $options_skipped;
+        $results['options_backed_up'] = $options_backed_up;
+
+        // 3. Verify. "Remaining" counts only what this route is responsible for moving: usermeta keys
+        //    still on the old prefix and `{old}user_roles`. Other options that start with the old
+        //    prefix are fixed names, left as they are by design.
+        // Counts every old-prefix key still in place, including the old . X keys deliberately left
+        // in a reverse overlap, so nothing stays on the old prefix unreported.
+        $remaining_usermeta = (int) $wpdb->get_var($wpdb->prepare(
             "SELECT COUNT(*) FROM `{$usermeta_table}` WHERE `meta_key` LIKE %s",
             $old_prefix_like . '%'
-        ));
-        $remaining_options = $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM `{$options_table}` WHERE `option_name` LIKE %s",
-            $old_prefix_like . '%'
-        ));
+        ) . ' AND (' . $starts_old('`meta_key`') . ($new_starts_with_old ? ' AND NOT ' . $starts_new('`meta_key`') : '') . ')');
+        if ($wpdb->last_error) {
+            $usermeta_errors[] = $wpdb->last_error;
+        }
+        $other_old_options = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `{$options_table}` WHERE `option_name` LIKE %s AND NOT (`option_name` = CAST(%s AS BINARY))",
+            $old_prefix_like . '%', $old_prefix . 'user_roles'
+        ) . ' AND ' . $to_move('`option_name`'));
+        if ($wpdb->last_error) {
+            $options_errors[] = $wpdb->last_error;
+        }
+        $results['usermeta_error'] = $usermeta_errors ? implode('; ', array_unique($usermeta_errors)) : null;
+        $results['options_error'] = $options_errors ? implode('; ', array_unique($options_errors)) : null;
 
-        $has_errors = !empty($results['usermeta_error']) || !empty($results['options_error']) || !empty((isset($results['sitemeta_error']) ? $results['sitemeta_error'] : null));
-        $results['success'] = !$has_errors;
-        $results['remaining_old_prefix_usermeta'] = (int) $remaining_usermeta;
-        $results['remaining_old_prefix_options'] = (int) $remaining_options;
-
-        if ($remaining_usermeta > 0 || $remaining_options > 0) {
-            $results['warning'] = 'Some entries still have the old prefix — this may indicate nested or overlapping prefixes.';
+        // sitemeta: core builds no network option name from the prefix, so nothing is renamed there
+        // any more; the keys stay in the response for callers that read them.
+        if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($new_prefix . 'sitemeta')))) {
+            $results['sitemeta_updated'] = 0;
+            $results['sitemeta_error'] = null;
+        }
+        $results['success'] = empty($results['usermeta_error']) && empty($results['options_error']);
+        $results['remaining_old_prefix_usermeta'] = $remaining_usermeta;
+        $results['remaining_old_prefix_options'] = $remaining_roles;
+        $results['other_old_prefix_options_kept'] = $other_old_options;
+        if ($usermeta_replaced || $options_backed_up) {
+            $results['backup_suffix'] = $backup_suffix;
+        }
+        if ($usermeta_skipped || $options_skipped) {
+            $results['warning'] = 'Some keys already existed under the new prefix and could not be moved aside, so they were left in place. Review them by hand.';
+        } elseif ($results['remaining_old_prefix_usermeta'] > 0 || $remaining_roles > 0) {
+            $results['warning'] = 'Some entries still have the old prefix.';
+        }
+        if ($other_old_options > 0) {
+            $results['note'] = 'Options whose fixed names happen to start with the old prefix (e.g. wp_page_for_privacy_policy, wp_mail_smtp) are not prefix-scoped and were deliberately left unchanged.';
         }
 
         return rest_ensure_response($results);
@@ -4841,6 +5050,32 @@ class InstaMigrate {
         // Max bytes per multi-row INSERT statement (keep under max_allowed_packet, typically 16MB+)
         $max_insert_bytes = 1048576; // 1MB per statement — safe default
 
+        // A failed SELECT must fail the export (1.9.3): an empty result used to end the table
+        // silently, so a dump could be short and still report success. The partial file is removed.
+        // MySQL 8 rejects a comparison with a zero-in-date key ('2024-00-00') under NO_ZERO_IN_DATE,
+        // which WordPress leaves on (NO_ZERO_DATE too, if a site re-enables it). The export only
+        // reads, so those two modes are dropped for its queries and the session's own sql_mode is
+        // put back afterwards.
+        $saved_sql_mode = $wpdb->get_var('SELECT @@SESSION.sql_mode');
+        if (is_string($saved_sql_mode)) {
+            $relaxed = implode(',', array_diff(array_filter(explode(',', $saved_sql_mode)), ['NO_ZERO_IN_DATE', 'NO_ZERO_DATE']));
+            $wpdb->query($wpdb->prepare('SET SESSION sql_mode = %s', $relaxed));
+        }
+        $restore_sql_mode = function () use ($saved_sql_mode) {
+            global $wpdb;
+            if (is_string($saved_sql_mode)) {
+                $wpdb->query($wpdb->prepare('SET SESSION sql_mode = %s', $saved_sql_mode));
+            }
+        };
+        $abort = function ($message) use ($gzip, $final_file, &$gz, &$fh, $restore_sql_mode) {
+            global $wpdb;
+            $wpdb->query('ROLLBACK');
+            $restore_sql_mode();
+            if ($gzip) { gzclose($gz); } else { fclose($fh); }
+            @unlink($final_file);
+            return new WP_Error('export_failed', $message, ['status' => 500]);
+        };
+
         foreach ($tables as $table) {
             // Sanitize table name (from SHOW TABLES — trusted DB metadata).
             $safe_table = preg_replace('/[^a-zA-Z0-9_]/', '', $table);
@@ -4880,19 +5115,81 @@ class InstaMigrate {
             // Export data using multi-row INSERT for 10-50x faster imports.
             // Batches rows into: INSERT INTO `t` (...) VALUES (...),(...),(...);
             // Flushes when accumulated statement exceeds $max_insert_bytes.
+            // Paging (1.9.3): by primary key — "the next N rows after the last key seen" costs the
+            // same on every page, where LIMIT/OFFSET re-read every skipped row (quadratic on large
+            // tables) and, with no ORDER BY, could return a row on two pages and skip another. A
+            // table with no primary key (or a view) keeps the old OFFSET method. Batch size is set
+            // by bytes, not rows: ~8MB per SELECT from the table's average row length, halved when
+            // a batch comes out much larger than planned. The dump's format is unchanged.
+            $pk_columns = $safe_table === $table ? $this->export_primary_key($safe_table) : [];
+            $batch_size = $this->export_batch_rows($safe_table);
+            $last_key = null;
+            // Each table is read from one consistent snapshot (1.9.3), so rows the live site writes
+            // during the export cannot appear twice or go missing between pages. One transaction per
+            // table keeps metadata locks to the table being read. InnoDB only; others ignore it.
+            $wpdb->query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+            $snapshot = (false !== $wpdb->query('START TRANSACTION WITH CONSISTENT SNAPSHOT'));
+            // Safety net for keyset paging on InnoDB: the rows a table's snapshot holds, counted in the
+            // same snapshot. Exporting more than that (a comparison that cycles) or fewer (one that
+            // skips) stops the export instead of writing a wrong dump.
+            $expected_rows = null;
+            // HyperDB / LudicrousDB (`dbhs`) may send the transaction (a write, to the primary) and the
+            // SELECTs (to a replica) to different connections, so neither the snapshot nor the count is
+            // guaranteed there: skip the net.
+            if ($pk_columns && $snapshot && !property_exists($wpdb, 'dbhs') && 'innodb' === strtolower((string) $wpdb->get_var($wpdb->prepare(
+                'SELECT `ENGINE` FROM information_schema.TABLES WHERE `TABLE_SCHEMA` = DATABASE() AND `TABLE_NAME` = %s', $safe_table)))) {
+                $expected_rows = $wpdb->get_var("SELECT COUNT(*) FROM `$safe_table`");
+                if ($wpdb->last_error) {
+                    return $abort("Export of `$safe_table` failed: " . $wpdb->last_error);
+                }
+                $expected_rows = (int) $expected_rows;
+            }
+            $exported_rows = 0;
             $offset = 0;
-            $batch_size = 500;
             $columns_sql = null;
             $insert_prefix = null;
             $pending_values = [];
             $pending_bytes = 0;
 
             while (true) {
-                $rows = $wpdb->get_results(
-                    $wpdb->prepare("SELECT * FROM `$safe_table` LIMIT %d OFFSET %d", $batch_size, $offset),
-                    ARRAY_A
-                );
+                if ($pk_columns) {
+                    $sql = $this->export_keyset_sql($safe_table, $pk_columns, $last_key, $batch_size);
+                    if ($sql === null) {
+                        return $abort("Export of `$safe_table` stopped: a primary key value could not be encoded.");
+                    }
+                    $rows = $wpdb->get_results($sql, ARRAY_A);
+                } else {
+                    $rows = $wpdb->get_results(
+                        $wpdb->prepare("SELECT * FROM `$safe_table` LIMIT %d OFFSET %d", $batch_size, $offset),
+                        ARRAY_A
+                    );
+                }
+                if ($wpdb->last_error) {
+                    return $abort("Export of `$safe_table` failed: " . $wpdb->last_error);
+                }
+                $wpdb->flush();
                 if (empty($rows)) break;
+                if ($pk_columns) {
+                    $last = end($rows);
+                    $next_key = [];
+                    foreach ($pk_columns as $pk) {
+                        if (!array_key_exists($pk['name'], $last)) {
+                            return $abort("Export of `$safe_table` stopped: primary key column `{$pk['name']}` is not in the result.");
+                        }
+                        $next_key[] = $last[$pk['name']];
+                    }
+                    // Progress guard: a page must end past where the previous one ended.
+                    if ($last_key !== null && $next_key === $last_key) {
+                        return $abort("Export of `$safe_table` stopped: paging made no progress.");
+                    }
+                    $last_key = $next_key;
+                }
+                $fetched_rows = count($rows);
+                $fetched_bytes = 0;
+                $exported_rows += $fetched_rows;
+                if ($expected_rows !== null && $exported_rows > $expected_rows) {
+                    return $abort("Export of `$safe_table` stopped: more rows read than the table holds ($expected_rows).");
+                }
 
                 // Build column list once from first row
                 if ($columns_sql === null) {
@@ -4916,7 +5213,9 @@ class InstaMigrate {
                         }
                     }
                     $row_sql = '(' . implode(', ', $values) . ')';
+                    unset($values);
                     $row_bytes = strlen($row_sql);
+                    $fetched_bytes += $row_bytes;
 
                     // Flush if adding this row would exceed max statement size
                     if (!empty($pending_values) && ($pending_bytes + $row_bytes + 2) > $max_insert_bytes) {
@@ -4925,10 +5224,30 @@ class InstaMigrate {
                         $pending_bytes = 0;
                     }
 
+                    // A row that fills a statement on its own is written straight away, in pieces, so
+                    // its (hex-doubled) text is never copied again. Same bytes as the batched path.
+                    if ($row_bytes + 2 > $max_insert_bytes) {
+                        $write($insert_prefix);
+                        $write($row_sql);
+                        $write(";\n");
+                        unset($row_sql);
+                        continue;
+                    }
+
                     $pending_values[] = $row_sql;
                     $pending_bytes += $row_bytes + 2; // +2 for ",\n"
                 }
-                $offset += $batch_size;
+                unset($rows);
+                $offset += $fetched_rows;
+                // Hex roughly doubles each value; a batch over ~32MB of output (~16MB of data) is
+                // twice the plan, so the next ones are halved.
+                if ($fetched_bytes > 33554432 && $batch_size > 1) {
+                    $batch_size = max(1, (int) floor($batch_size / 2));
+                }
+            }
+
+            if ($expected_rows !== null && $exported_rows !== $expected_rows) {
+                return $abort("Export of `$safe_table` stopped: $exported_rows of $expected_rows rows read.");
             }
 
             // Flush remaining rows
@@ -4936,7 +5255,12 @@ class InstaMigrate {
                 $write($insert_prefix . implode(",\n", $pending_values) . ";\n");
             }
             $write("\n");
+            if ($snapshot) {
+                $wpdb->query('COMMIT');
+            }
         }
+
+        $restore_sql_mode();
 
         $write("COMMIT;\n");
         $write("SET unique_checks = 1;\n");
@@ -4961,6 +5285,139 @@ class InstaMigrate {
             'gzipped'    => $gzip,
             'skipped_data_tables' => $skipped_data,
         ]);
+    }
+
+    /**
+     * Primary-key columns of a table, in index order, for keyset paging (1.9.3), each with how its
+     * values are compared. Empty — the export keeps LIMIT/OFFSET — unless EVERY key column is visible
+     * (SELECT * returns it), has a plain name, is not a prefix index, and has an exact, totally
+     * ordered type: integers, DECIMAL, DATE/DATETIME/TIME/YEAR, CHAR/VARCHAR, BINARY/VARBINARY.
+     * FLOAT/DOUBLE keys compare inexactly (a page can match its own last row forever), and ENUM/SET,
+     * BIT, TIMESTAMP and JSON keys order differently from how a literal compares, so they keep OFFSET.
+     * Character keys qualify only in utf8/utf8mb4/ascii columns on a utf8mb4 connection.
+     *
+     * @return array<int, array{name: string, kind: string, charset: string, collation: string}>
+     */
+    private function export_primary_key($safe_table) {
+        global $wpdb;
+        $keys = $wpdb->get_results("SHOW KEYS FROM `$safe_table` WHERE `Key_name` = 'PRIMARY'", ARRAY_A);
+        if (!$keys || $wpdb->last_error) {
+            return [];
+        }
+        $columns = [];
+        foreach ((array) $wpdb->get_results("SHOW FULL COLUMNS FROM `$safe_table`", ARRAY_A) as $c) {
+            $columns[$c['Field']] = $c;
+        }
+        usort($keys, function ($a, $b) { return (int) $a['Seq_in_index'] - (int) $b['Seq_in_index']; });
+        $out = [];
+        foreach ($keys as $k) {
+            $name = (string) $k['Column_name'];
+            if (!empty($k['Sub_part']) || !preg_match('/^[A-Za-z0-9_]+$/', $name) || !isset($columns[$name])) {
+                return [];
+            }
+            $col   = $columns[$name];
+            $type  = strtolower((string) $col['Type']);
+            $extra = strtolower((string) $col['Extra']);
+            if (strpos($extra, 'invisible') !== false || strpos($extra, 'generated') !== false) {
+                return [];
+            }
+            $collation = (string) $col['Collation'];
+            if (preg_match('/^(tiny|small|medium|big)?int\b|^int\b|^integer\b|^year\b/', $type)) {
+                $kind = 'int';
+            } elseif (preg_match('/^(decimal|numeric|dec|fixed)\b/', $type)) {
+                $kind = 'dec';
+            } elseif (preg_match('/^(date|datetime|time)\b/', $type)) {
+                $kind = 'date';
+            } elseif (preg_match('/^(var)?binary\b/', $type)) {
+                $kind = 'bin';
+            } elseif (preg_match('/^(var)?char\b/', $type) && preg_match('/^([a-z0-9]+)_[a-z0-9_]+$/', $collation, $cm)
+                && in_array($cm[1], ['utf8mb4', 'utf8mb3', 'utf8', 'ascii'], true) && strtolower((string) $wpdb->charset) === 'utf8mb4') {
+                // Key values arrive in the connection's utf8mb4; only a column in the same encoding
+                // family compares them byte for byte. A latin1/cp1251/utf16 key keeps OFFSET.
+                $kind = 'str';
+            } else {
+                return [];
+            }
+            $out[] = ['name' => $name, 'kind' => $kind, 'charset' => isset($cm[1]) && $kind === 'str' ? $cm[1] : '', 'collation' => $kind === 'str' ? $collation : ''];
+        }
+        return $out;
+    }
+
+    /**
+     * Rows per SELECT for a table, sized for ~8MB of data from MySQL's average row length
+     * (no table scan): 1–500 rows, so a table of multi-MB rows is read a few rows at a time.
+     * 500 — the old fixed size — is also the ceiling, because the statistic can be far off
+     * (stale, or a few huge rows among small ones); the speed comes from keyset paging.
+     */
+    private function export_batch_rows($safe_table) {
+        global $wpdb;
+        $avg = (int) $wpdb->get_var($wpdb->prepare(
+            'SELECT `AVG_ROW_LENGTH` FROM information_schema.TABLES WHERE `TABLE_SCHEMA` = DATABASE() AND `TABLE_NAME` = %s',
+            $safe_table
+        ));
+        if ($avg <= 0) {
+            return 500;
+        }
+        return max(1, min(500, (int) floor(8388608 / $avg)));
+    }
+
+    /**
+     * One key value as an SQL literal that compares exactly as the column does, built from ASCII
+     * only (wpdb refuses non-ASCII queries on some table charsets): numbers and dates as validated
+     * text, character keys as hex converted to the column's charset and collation, binary keys as
+     * hex. Null when the value doesn't fit its kind.
+     */
+    private function export_key_literal(array $pk, $value) {
+        $v = (string) $value;
+        switch ($pk['kind']) {
+            case 'int':
+                return preg_match('/^-?[0-9]+$/', $v) ? $v : null;
+            case 'dec':
+                return preg_match('/^-?[0-9]+(\.[0-9]+)?$/', $v) ? $v : null;
+            case 'date':
+                return preg_match('/^-?[0-9:. -]+$/', $v) ? "'" . $v . "'" : null;
+            case 'bin':
+                return $v === '' ? "''" : '0x' . bin2hex($v);
+            case 'str':
+                $hex = $v === '' ? "''" : '0x' . bin2hex($v);
+                return 'CONVERT(' . $hex . ' USING ' . $pk['charset'] . ') COLLATE ' . $pk['collation'];
+        }
+        return null;
+    }
+
+    /**
+     * The next page after $last_key (null = the first page), ordered by the primary key. A composite
+     * key uses the expanded form (a > x) OR (a = x AND b > y) …, which MySQL can serve from the index.
+     * Null when a key value can't be encoded.
+     */
+    private function export_keyset_sql($safe_table, array $pk_columns, $last_key, $limit) {
+        $order = [];
+        foreach ($pk_columns as $pk) {
+            $order[] = '`' . $pk['name'] . '`';
+        }
+        $where = '';
+        if ($last_key !== null) {
+            $lits = [];
+            foreach ($pk_columns as $i => $pk) {
+                $lit = $this->export_key_literal($pk, $last_key[$i]);
+                if ($lit === null) {
+                    return null;
+                }
+                $lits[] = $lit;
+            }
+            $or = [];
+            $n  = count($pk_columns);
+            for ($i = 0; $i < $n; $i++) {
+                $and = [];
+                for ($j = 0; $j < $i; $j++) {
+                    $and[] = '`' . $pk_columns[$j]['name'] . '` = ' . $lits[$j];
+                }
+                $and[] = '`' . $pk_columns[$i]['name'] . '` > ' . $lits[$i];
+                $or[] = '(' . implode(' AND ', $and) . ')';
+            }
+            $where = ' WHERE ' . implode(' OR ', $or);
+        }
+        return "SELECT * FROM `$safe_table`$where ORDER BY " . implode(', ', $order) . ' LIMIT ' . (int) $limit;
     }
 
     // ─── Route: Files Archive ───────────────────────────────────
